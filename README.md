@@ -196,6 +196,10 @@ cargo run --bin shot -- out.bmp samples/before.rs samples/after.rs
 
 ## 架构
 
+术语表见 [CONTEXT.md](CONTEXT.md) —— row / line / side / filler / hunk 这些词在
+代码和讨论中含义固定，改动前建议先扫一眼。
+
+
 ```
 src/
 ├── core/                  纯逻辑，不依赖 GUI，可独立测试
