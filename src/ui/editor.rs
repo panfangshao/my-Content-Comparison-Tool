@@ -277,6 +277,7 @@ pub fn show_pane(ui: &mut Ui, p: PaneParams<'_>) -> PaneOutput {
             side,
             rect,
             gutter_w,
+            text_w,
             line_h,
             palette,
             style,
@@ -409,16 +410,23 @@ pub fn show_pane(ui: &mut Ui, p: PaneParams<'_>) -> PaneOutput {
             if let Some(row) = diff.row_of(side, line) {
                 let text = buffer.line(line);
                 let col = tabs::to_display(text, style.tab_width, col);
-                let advance = style.font.size * 0.62;
+                let wrap = if style.word_wrap {
+                    text_w
+                } else {
+                    f32::INFINITY
+                };
+                let measured = measure_line(&text_painter, text, style, wrap, palette.text);
+                let at = measured.pos_from_cursor(CCursor::new(col));
 
                 let y = rect.top() + layout.row_top(row, line_h);
-                let caret = Rect::from_min_size(
-                    pos2(rect.left() + gutter_w + col as f32 * advance, y),
-                    Vec2::new(2.0, layout.row_height(row, line_h)),
+                let caret = Rect::from_min_max(
+                    pos2(rect.left() + gutter_w + at.min.x, y + at.min.y),
+                    pos2(rect.left() + gutter_w + at.min.x + 2.0, y + at.max.y),
                 );
                 // Reveal a little context around it rather than parking the
                 // caret flush against the edge of the viewport.
-                ui.scroll_to_rect(caret.expand2(Vec2::new(advance * 6.0, line_h)), None);
+                let margin = Vec2::new(style.font.size * 4.0, line_h);
+                ui.scroll_to_rect(caret.expand2(margin), None);
             }
         }
 
@@ -441,6 +449,8 @@ struct RowCtx<'a> {
     side: Side,
     rect: Rect,
     gutter_w: f32,
+    /// Width available to the text, i.e. the wrap width when wrapping.
+    text_w: f32,
     line_h: f32,
     palette: &'a Palette,
     style: &'a EditorStyle,
@@ -850,6 +860,7 @@ fn paint_gutter_backdrop(
 /// Translate a screen position to a character offset in the buffer.
 fn char_at_pos(
     pos: Pos2,
+    painter: &Painter,
     buffer: &TextBuffer,
     diff: &DiffResult,
     layout: &RowLayout,
@@ -866,13 +877,26 @@ fn char_at_pos(
         None => nearest_line(diff, row_idx, side)?,
     };
 
+    // Ask the same layout the renderer produced where that point falls.
+    //
+    // This used to divide by an assumed character advance. The assumption was
+    // close for one glyph and wrong by several columns by the middle of a
+    // line - and hopelessly wrong for CJK, which is double width - so the
+    // caret landed somewhere other than where the user clicked.
     let line = buffer.line(line_idx);
-    let text_left = rect.left() + ctx.gutter_w;
-    let rel_x = (pos.x - text_left).max(0.0);
+    let wrap = if style.word_wrap {
+        ctx.text_w
+    } else {
+        f32::INFINITY
+    };
+    let galley = measure_line(painter, line, style, wrap, ctx.palette.text);
 
-    // Reproduce the row's layout to map x back to a column.
-    let col_display = column_at_x(line, rel_x, style);
-    let col = tabs::from_display(line, style.tab_width, col_display);
+    let origin = pos2(
+        rect.left() + ctx.gutter_w,
+        rect.top() + layout.row_top(row_idx, ctx.line_h),
+    );
+    let cursor = galley.cursor_from_pos(pos - origin);
+    let col = tabs::from_display(line, style.tab_width, cursor.index.0);
     Some(buffer.char_at(line_idx, col))
 }
 
@@ -885,15 +909,20 @@ fn nearest_line(diff: &DiffResult, row_idx: usize, side: Side) -> Option<usize> 
         .or_else(|| diff.rows.iter().find_map(|r| r.side(side)))
 }
 
-/// Approximate column from an x offset, using the monospace advance.
+/// Lay a line out exactly as the renderer does, for hit-testing and caret
+/// geometry.
 ///
-/// Exact hit-testing would need the galley, which the input path does not have;
-/// the error is under half a character and only shows up on proportional
-/// fallback glyphs.
-fn column_at_x(line: &str, x: f32, style: &EditorStyle) -> usize {
-    let adv = (style.font.size * 0.62).max(1.0);
-    let col = (x / adv).round().max(0.0) as usize;
-    col.min(tabs::expand(line, style.tab_width).chars().count())
+/// Colour and italics do not affect glyph advances, so the syntax spans can be
+/// left out; the font, the tab expansion and the wrap width are what matter.
+fn measure_line(
+    painter: &Painter,
+    line: &str,
+    style: &EditorStyle,
+    wrap_width: f32,
+    color: Color32,
+) -> Arc<Galley> {
+    let display = tabs::expand(line, style.tab_width);
+    build_galley(painter, line, &display, &[], color, style, wrap_width)
 }
 
 fn handle_mouse(
@@ -908,7 +937,7 @@ fn handle_mouse(
     let Some(pos) = response.interact_pointer_pos() else {
         return;
     };
-    let Some(ci) = char_at_pos(pos, buffer, diff, layout, ctx) else {
+    let Some(ci) = char_at_pos(pos, ui.painter(), buffer, diff, layout, ctx) else {
         return;
     };
     // Any pointer interaction re-aims the caret, so a remembered column from
@@ -1129,25 +1158,81 @@ mod tests {
         assert_eq!(nearest_line(&d, 0, Side::Right), Some(0));
     }
 
+    /// Hit-testing must go through a real layout.
+    ///
+    /// The previous implementation divided x by an assumed advance of
+    /// `font_size * 0.62`. This shows how far that drifts: by the middle of an
+    /// ordinary line the guess is already off by more than a whole character,
+    /// which is exactly what made clicks land in the wrong place.
     #[test]
-    fn column_at_x_is_monotonic_and_clamped() {
+    fn the_old_advance_estimate_really_was_wrong() {
         let s = style();
-        let line = "hello world";
-        let mut last = 0;
-        for px in (0..400).step_by(7) {
-            let c = column_at_x(line, px as f32, &s);
-            assert!(c >= last, "column went backwards");
-            assert!(c <= line.chars().count());
-            last = c;
-        }
-        assert_eq!(column_at_x(line, 0.0, &s), 0);
-        assert_eq!(column_at_x(line, 10_000.0, &s), line.chars().count());
+        let ctx = egui::Context::default();
+        let line = "fn compute(alpha: u32, beta: u32) -> u32 { alpha + beta }";
+
+        let mut error_at_column_40 = 0.0_f32;
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui: &mut Ui| {
+            let galley = measure_line(ui.painter(), line, &s, f32::INFINITY, Color32::WHITE);
+            let real = galley.pos_from_cursor(CCursor::new(40)).min.x;
+            let guessed = 40.0 * s.font.size * 0.62;
+            error_at_column_40 = (real - guessed).abs();
+        });
+        out.textures_delta.clear();
+
+        assert!(
+            error_at_column_40 > s.font.size * 0.62,
+            "the estimate was off by {error_at_column_40}pt at column 40, \
+             less than one character - this test no longer proves anything"
+        );
     }
 
+    /// Every column must hit-test back to itself when probed at the point it
+    /// is actually drawn.
     #[test]
-    fn column_at_x_accounts_for_expanded_tabs() {
+    fn every_column_hit_tests_back_to_itself() {
         let s = style();
-        // "\tx" displays as five columns, so a far-right click clamps to 5.
-        assert_eq!(column_at_x("\tx", 10_000.0, &s), 5);
+        let ctx = egui::Context::default();
+
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui: &mut Ui| {
+            for line in [
+                "fn compute(alpha: u32) -> u32 { alpha }",
+                "\tindented\twith\ttabs",
+                "对比工具 mixed 宽度 text",
+            ] {
+                let galley = measure_line(ui.painter(), line, &s, f32::INFINITY, Color32::WHITE);
+                let display_cols = tabs::expand(line, s.tab_width).chars().count();
+
+                for col in 0..display_cols {
+                    let here = galley.pos_from_cursor(CCursor::new(col)).min.x;
+                    let next = galley.pos_from_cursor(CCursor::new(col + 1)).min.x;
+                    let width = next - here;
+
+                    // A caret sits *between* characters, so the left half of a
+                    // glyph belongs to the position before it and the right
+                    // half to the one after. Both halves must land where the
+                    // pixels say, which is what the old advance estimate got
+                    // progressively wrong along the line.
+                    let left_half = galley
+                        .cursor_from_pos(egui::vec2(here + width * 0.25, 1.0))
+                        .index
+                        .0;
+                    assert_eq!(
+                        left_half, col,
+                        "the left half of column {col} of {line:?} gave {left_half}"
+                    );
+
+                    let right_half = galley
+                        .cursor_from_pos(egui::vec2(here + width * 0.75, 1.0))
+                        .index
+                        .0;
+                    assert_eq!(
+                        right_half,
+                        col + 1,
+                        "the right half of column {col} of {line:?} gave {right_half}"
+                    );
+                }
+            }
+        });
+        out.textures_delta.clear();
     }
 }
