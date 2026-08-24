@@ -821,6 +821,8 @@ impl eframe::App for DuiBi {
         self.draw_top(ui, &mut actions);
         self.draw_status(ui);
         self.draw_central(ui, &mut actions);
+        // Both panes have reported their heights; fold them in for next frame.
+        self.layout.commit_measurements();
         self.clear_scroll_requests();
         self.draw_overlays(ui, &mut actions);
 

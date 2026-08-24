@@ -216,6 +216,13 @@ pub fn show_pane(ui: &mut Ui, p: PaneParams<'_>) -> PaneOutput {
         // clicks in its top 60 pixels - and an empty one only in a single row
         // beside line number 1. Clicking anywhere in an editor should put the
         // caret somewhere, which `char_at_pos` handles by clamping.
+        // Each pane wraps at its own width - the split is rarely exactly half -
+        // so the layout has to know both, and invalidate only the side that
+        // actually changed.
+        if style.word_wrap {
+            layout.set_wrap_width(side, text_w);
+        }
+
         let (rect, response) = ui.allocate_exact_size(
             Vec2::new(gutter_w + text_w, total_h.max(pane_rect.height())),
             Sense::click_and_drag(),
@@ -339,9 +346,9 @@ pub fn show_pane(ui: &mut Ui, p: PaneParams<'_>) -> PaneOutput {
                 if style.word_wrap { text_w } else { f32::INFINITY },
             );
 
-            // Feed the true height back so the scrollbar converges.
+            // Feed this side's true height back for the *next* frame.
             if style.word_wrap {
-                layout.measure(row_idx, galley.rows.len() as u32);
+                layout.measure(side, row_idx, galley.rows.len() as u32);
             }
 
             let origin = pos2(rect.left() + gutter_w, y);
