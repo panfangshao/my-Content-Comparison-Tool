@@ -82,6 +82,11 @@ row 不会打断一个 hunk。
 `anchor`（起点，拖动时不动）+ `head`（光标现在的位置），单位是**字符**索引，
 不是字节。
 
+### Vertical motion（上下移动方式）
+`KeepColumn`（保持列，默认，大多数编辑器的行为）或 `LineEnd`（落到目标行行尾）。
+**与差异高亮粒度无关**——粒度只决定改动怎么涂色。两者曾经被误认为是一回事，
+所以现在一个在「视图」菜单、一个在「对比」菜单，且各自的说明都点明了这一点。
+
 ### Goal column（目标列）
 上下移动时光标想保持的列。必须跨帧保存——否则穿过一个短行就丢了。
 
@@ -100,6 +105,7 @@ row 不会打断一个 hunk。
 | blank line（指对齐空白时） | **filler** |
 | boundary / API | **seam** / **interface** |
 | block / chunk / region | **hunk** |
+| granularity（指光标时） | 它只指**高亮粒度**，光标用 **vertical motion** |
 
 ---
 

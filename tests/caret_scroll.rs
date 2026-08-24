@@ -13,6 +13,7 @@ use egui::{Event, Key, Modifiers, PointerButton, Pos2, RawInput, Rect, Vec2, pos
 
 use duibi::core::diff::{Budget, DiffOptions, DiffResult, Side, diff_lines};
 use duibi::core::text::TextBuffer;
+use duibi::ui::editing::VerticalMotion;
 use duibi::ui::editor::{EditorStyle, InlineCache, PaneParams, show_pane};
 use duibi::ui::rowlayout::RowLayout;
 use duibi::ui::theme::Palette;
@@ -74,6 +75,7 @@ impl Pane {
                 show_whitespace: false,
                 word_wrap: false,
                 tab_width: 4,
+                vertical_motion: VerticalMotion::KeepColumn,
                 gutter_width: 0.0,
             },
             palette: Palette::dark(),

@@ -24,7 +24,7 @@ use egui::{Align2, Color32, FontId, Galley, Painter, Pos2, Rect, Response, Sense
 
 use crate::core::diff::{DiffOptions, DiffResult, InlineDiff, RowKind, Side, inline_diff};
 use crate::core::text::{Match, Selection, TextBuffer};
-use crate::ui::editing::{self, Motion};
+use crate::ui::editing::{self, Motion, VerticalMotion};
 use crate::ui::highlight::StyledRange;
 use crate::ui::rowlayout::RowLayout;
 use crate::ui::tabs;
@@ -45,6 +45,8 @@ pub struct EditorStyle {
     pub show_whitespace: bool,
     pub word_wrap: bool,
     pub tab_width: usize,
+    /// Where Up and Down land horizontally.
+    pub vertical_motion: VerticalMotion,
     /// Width of the digits column, derived from the largest line number.
     pub gutter_width: f32,
 }
@@ -1033,7 +1035,8 @@ fn handle_keyboard(
                 };
 
                 if let Some(m) = motion {
-                    let moved = editing::move_caret(buffer, m, shift, *goal);
+                    let moved =
+                        editing::move_caret(buffer, m, shift, *goal, style.vertical_motion);
                     // `move_caret` returns `None` for horizontal motions, which
                     // is how the remembered column gets cleared.
                     *goal = moved.goal_column;
@@ -1086,6 +1089,7 @@ mod tests {
             show_whitespace: false,
             word_wrap: false,
             tab_width: 4,
+                vertical_motion: VerticalMotion::KeepColumn,
             gutter_width: 60.0,
         }
     }

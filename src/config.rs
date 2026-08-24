@@ -58,6 +58,10 @@ pub struct Config {
     pub sync_scroll: bool,
     pub show_line_numbers: bool,
     pub show_whitespace: bool,
+
+    /// Up and Down land at the end of the target line instead of keeping the
+    /// column. Off by default, which is how every other editor behaves.
+    pub caret_to_line_end: bool,
     pub syntax_highlighting: bool,
     pub show_overview: bool,
 
@@ -91,6 +95,7 @@ impl Default for Config {
             sync_scroll: true,
             show_line_numbers: true,
             show_whitespace: false,
+            caret_to_line_end: false,
             syntax_highlighting: true,
             show_overview: true,
             single_pane: false,

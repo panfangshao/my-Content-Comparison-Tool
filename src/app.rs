@@ -299,6 +299,11 @@ impl DuiBi {
             show_whitespace: self.config.show_whitespace,
             word_wrap: self.config.word_wrap,
             tab_width: crate::ui::tabs::TAB_WIDTH,
+            vertical_motion: if self.config.caret_to_line_end {
+                crate::ui::editing::VerticalMotion::LineEnd
+            } else {
+                crate::ui::editing::VerticalMotion::KeepColumn
+            },
             gutter_width: 0.0,
         }
     }

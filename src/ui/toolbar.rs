@@ -292,6 +292,8 @@ fn view_menu(ui: &mut Ui, config: &mut Config, lang: Lang, actions: &mut Vec<Act
         ui.checkbox(&mut config.word_wrap, t(lang, "view.word_wrap"));
         ui.checkbox(&mut config.show_line_numbers, t(lang, "view.line_numbers"));
         ui.checkbox(&mut config.show_whitespace, t(lang, "view.whitespace"));
+        ui.checkbox(&mut config.caret_to_line_end, t(lang, "view.caret_line_end"))
+            .on_hover_text(t(lang, "view.caret_line_end.hint"));
         ui.checkbox(&mut config.syntax_highlighting, t(lang, "view.syntax"));
         // Both of these describe the relationship between two panes.
         ui.add_enabled_ui(!config.single_pane, |ui| {
@@ -339,6 +341,8 @@ fn compare_menu(ui: &mut Ui, config: &mut Config, lang: Lang) {
             }
         });
         ui.menu_button(t(lang, "cmp.granularity"), |ui| {
+            ui.label(RichText::new(t(lang, "cmp.granularity.hint")).small().weak());
+            ui.separator();
             for g in Granularity::ALL {
                 let key = match g {
                     Granularity::Line => "cmp.granularity.line",
@@ -554,7 +558,10 @@ fn quick_row(
         ui.separator();
 
         // Granularity is the control people reach for most, so it gets a
-        // permanent home rather than living two menus deep.
+        // permanent home rather than living two menus deep. It is labelled,
+        // because three bare words invite the guess that they are about the
+        // caret rather than about colour.
+        ui.label(RichText::new(t(lang, "cmp.granularity.short")).weak());
         for g in Granularity::ALL {
             let key = match g {
                 Granularity::Line => "cmp.granularity.line",

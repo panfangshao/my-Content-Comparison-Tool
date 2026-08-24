@@ -6,6 +6,22 @@
 
 use crate::core::text::{Selection, TextBuffer};
 
+/// Where Up and Down land horizontally.
+///
+/// Separate from the difference-highlighting granularity, which is about how a
+/// changed line is painted and has nothing to do with the caret. Tying the two
+/// together would mean changing how differences look also changed how typing
+/// feels.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum VerticalMotion {
+    /// Keep the column, as every editor does: moving down through a short line
+    /// and out the other side returns to the column you started in.
+    #[default]
+    KeepColumn,
+    /// Land at the end of the line moved to.
+    LineEnd,
+}
+
 /// A caret movement request.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Motion {
@@ -70,6 +86,7 @@ pub fn move_caret(
     motion: Motion,
     extend: bool,
     goal_column: Option<usize>,
+    vertical: VerticalMotion,
 ) -> Moved {
     let sel = buf.selection();
     let (line, col) = buf.line_col(sel.head);
@@ -91,10 +108,14 @@ pub fn move_caret(
         Motion::Left => (sel.head.saturating_sub(1), None),
         Motion::Right => ((sel.head + 1).min(buf.len_chars()), None),
 
-        Motion::Up => vertical(buf, line, col, goal_column, -1),
-        Motion::Down => vertical(buf, line, col, goal_column, 1),
-        Motion::PageUp(n) => vertical(buf, line, col, goal_column, -(n as isize)),
-        Motion::PageDown(n) => vertical(buf, line, col, goal_column, n as isize),
+        Motion::Up => move_vertically(buf, line, col, goal_column, -1, vertical),
+        Motion::Down => move_vertically(buf, line, col, goal_column, 1, vertical),
+        Motion::PageUp(n) => {
+            move_vertically(buf, line, col, goal_column, -(n as isize), vertical)
+        }
+        Motion::PageDown(n) => {
+            move_vertically(buf, line, col, goal_column, n as isize, vertical)
+        }
 
         Motion::WordLeft => (word_left(buf, sel.head), None),
         Motion::WordRight => (word_right(buf, sel.head), None),
@@ -114,21 +135,34 @@ pub fn move_caret(
     }
 }
 
-/// Vertical movement by `delta` logical lines, remembering the goal column.
-fn vertical(
+/// Vertical movement by `delta` logical lines.
+fn move_vertically(
     buf: &TextBuffer,
     line: usize,
     col: usize,
     goal_column: Option<usize>,
     delta: isize,
+    mode: VerticalMotion,
 ) -> (usize, Option<usize>) {
-    let goal = goal_column.unwrap_or(col);
     let last = buf.len_lines().saturating_sub(1);
     let target = (line as isize + delta).clamp(0, last as isize) as usize;
+    let at_edge = target == line;
 
+    if mode == VerticalMotion::LineEnd {
+        // Nothing to remember: the destination is decided by the target line,
+        // not by where the caret started.
+        let head = if at_edge && delta < 0 {
+            0
+        } else {
+            buf.line_end(target)
+        };
+        return (head, None);
+    }
+
+    let goal = goal_column.unwrap_or(col);
     // Moving past either end parks the caret at the document boundary, which
     // is what pressing Up on the first line should do.
-    if target == line {
+    if at_edge {
         let head = if delta < 0 { 0 } else { buf.len_chars() };
         return (head, Some(goal));
     }
@@ -326,7 +360,7 @@ mod tests {
     }
 
     fn head(b: &TextBuffer, motion: Motion, extend: bool) -> usize {
-        move_caret(b, motion, extend, None).selection.head
+        move_caret(b, motion, extend, None, VerticalMotion::KeepColumn).selection.head
     }
 
     #[test]
@@ -352,7 +386,7 @@ mod tests {
     fn shift_extends_from_the_anchor() {
         let mut b = TextBuffer::from_text("hello");
         b.set_selection(Selection::at(2));
-        let m = move_caret(&b, Motion::Right, true, None);
+        let m = move_caret(&b, Motion::Right, true, None, VerticalMotion::KeepColumn);
         assert_eq!(m.selection.anchor, 2);
         assert_eq!(m.selection.head, 3);
     }
@@ -362,18 +396,87 @@ mod tests {
         // Down from a long line, through a short one, back to a long one.
         let b = buf("abcdefgh\nxy\nijklmnop", 6); // line 0, column 6
 
-        let down = move_caret(&b, Motion::Down, false, None);
+        let down = move_caret(&b, Motion::Down, false, None, VerticalMotion::KeepColumn);
         assert_eq!(b.line_col(down.selection.head), (1, 2), "clamped to short line");
         assert_eq!(down.goal_column, Some(6));
 
         let mut b2 = b;
         b2.set_selection(down.selection);
-        let down2 = move_caret(&b2, Motion::Down, false, down.goal_column);
+        let down2 = move_caret(&b2, Motion::Down, false, down.goal_column, VerticalMotion::KeepColumn);
         assert_eq!(
             b2.line_col(down2.selection.head),
             (2, 6),
             "the goal column must be restored"
         );
+    }
+
+    fn head_with(b: &TextBuffer, motion: Motion, mode: VerticalMotion) -> usize {
+        move_caret(b, motion, false, None, mode).selection.head
+    }
+
+    /// The alternative behaviour: Up and Down land at the end of the line.
+    #[test]
+    fn line_end_mode_lands_at_the_end_of_the_target_line() {
+        let b = buf("abcdefgh\nxy\nijklmnop", 3); // line 0, column 3
+
+        let up_down = VerticalMotion::LineEnd;
+        let down = head_with(&b, Motion::Down, up_down);
+        assert_eq!(b.line_col(down), (1, 2), "should sit after `xy`");
+
+        let mut b2 = buf("abcdefgh\nxy\nijklmnop", down);
+        b2.set_selection(Selection::at(down));
+        let down2 = head_with(&b2, Motion::Down, up_down);
+        assert_eq!(b2.line_col(down2), (2, 8), "should sit after `ijklmnop`");
+    }
+
+    #[test]
+    fn line_end_mode_works_upwards_too() {
+        let b = buf("first line\nshort\nthird", 20); // somewhere on line 2
+        let up = head_with(&b, Motion::Up, VerticalMotion::LineEnd);
+        assert_eq!(b.line_col(up), (1, 5), "should sit after `short`");
+    }
+
+    #[test]
+    fn line_end_mode_forgets_the_goal_column() {
+        let b = buf("abcdefgh\nxy\nijklmnop", 6);
+        let moved = move_caret(&b, Motion::Down, false, None, VerticalMotion::LineEnd);
+        assert_eq!(
+            moved.goal_column, None,
+            "there is no column to remember when the destination is the end"
+        );
+    }
+
+    #[test]
+    fn line_end_mode_still_stops_at_the_document_edges() {
+        let b = buf("abc\ndef", 2);
+        assert_eq!(head_with(&b, Motion::Up, VerticalMotion::LineEnd), 0);
+
+        let b = buf("abc\ndef", 5);
+        let down = head_with(&b, Motion::Down, VerticalMotion::LineEnd);
+        assert_eq!(down, b.len_chars());
+    }
+
+    #[test]
+    fn line_end_mode_leaves_horizontal_motion_alone() {
+        let b = buf("hello", 2);
+        assert_eq!(head_with(&b, Motion::Left, VerticalMotion::LineEnd), 1);
+        assert_eq!(head_with(&b, Motion::Right, VerticalMotion::LineEnd), 3);
+    }
+
+    /// The two modes must genuinely differ, or the setting does nothing.
+    #[test]
+    fn the_two_modes_disagree_where_it_matters() {
+        // The target line has to be *longer* than the starting column for the
+        // difference to show: moving onto a shorter line clamps to its end
+        // either way, which is the case that makes a careless test pass for
+        // free. So start on the short middle line and move down to the long one.
+        let b = buf("abcdefgh\nxy\nijklmnop", 10); // line 1, column 1
+
+        let keep = head_with(&b, Motion::Down, VerticalMotion::KeepColumn);
+        let end = head_with(&b, Motion::Down, VerticalMotion::LineEnd);
+        assert_eq!(b.line_col(keep), (2, 1), "the column should be kept");
+        assert_eq!(b.line_col(end), (2, 8), "should land after `ijklmnop`");
+        assert_ne!(keep, end);
     }
 
     #[test]
@@ -392,7 +495,7 @@ mod tests {
     fn page_movement_travels_many_lines() {
         let text = (0..100).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
         let b = buf(&text, 0);
-        let m = move_caret(&b, Motion::PageDown(30), false, None);
+        let m = move_caret(&b, Motion::PageDown(30), false, None, VerticalMotion::KeepColumn);
         assert_eq!(b.line_col(m.selection.head).0, 30);
     }
 
@@ -595,7 +698,7 @@ mod tests {
             let mut b2 = TextBuffer::from_text("abc\ndef\n");
             b2.set_selection(Selection::at(start));
             for m in motions {
-                let r = move_caret(&b2, m, false, None);
+                let r = move_caret(&b2, m, false, None, VerticalMotion::KeepColumn);
                 assert!(
                     r.selection.head <= b2.len_chars(),
                     "{m:?} from {start} escaped the document"
