@@ -11,3 +11,4 @@ pub mod statusbar;
 pub mod tabs;
 pub mod theme;
 pub mod toolbar;
+pub mod viewport;

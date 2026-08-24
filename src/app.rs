@@ -22,6 +22,7 @@ use crate::ui::overview::{OverviewParams, show_overview};
 use crate::ui::rowlayout::RowLayout;
 use crate::ui::statusbar::{StatusFacts, show_status_bar};
 use crate::ui::theme::{Appearance, Palette, StyleKey};
+use crate::ui::viewport::{Reveal, Viewport};
 use crate::ui::toolbar::{Action, MenuFacts, show_toolbar};
 
 /// How long after the last keystroke before the comparison re-runs.
@@ -169,16 +170,11 @@ pub struct DuiBi {
     confirm: Option<Confirm>,
     show_shortcuts: bool,
 
-    /// Scroll position both panes share.
-    scroll: Vec2,
-    /// Which pane last drove the scroll; the other follows.
-    scroll_master: Option<Side>,
-    /// Centre both panes on this row next frame (jump to a difference, a
-    /// search hit, or a click on the overview strip).
-    scroll_to_row: Option<usize>,
-    /// Put both panes at exactly this offset next frame. Used to hold the view
-    /// still across a re-comparison.
-    pending_scroll: Option<Vec2>,
+    /// Where the two panes are looking, and anything about to move them.
+    viewport: Viewport,
+    /// Height of one pane, recorded while drawing so a jump knows how much of
+    /// the document fits on screen.
+    viewport_height: f32,
     focused_hunk: Option<usize>,
 
     /// Screen x where the left pane ends and the right one begins, recorded
@@ -222,10 +218,8 @@ impl DuiBi {
             toast: None,
             confirm: None,
             show_shortcuts: false,
-            scroll: Vec2::ZERO,
-            scroll_master: None,
-            scroll_to_row: None,
-            pending_scroll: None,
+            viewport: Viewport::default(),
+            viewport_height: 600.0,
             focused_hunk: None,
             pane_boundary_x: f32::INFINITY,
             hover_drop_x: None,
@@ -341,13 +335,9 @@ impl DuiBi {
         // and the scroll offset is measured in pixels, not lines. Without an
         // anchor the text slides out from under whatever the user was reading.
         let line_h = self.editor_style().line_height;
-        let anchor = {
-            let row = self.layout.row_at(self.scroll.y, line_h);
-            self.diff
-                .rows
-                .get(row)
-                .and_then(|r| r.side(self.focus_side))
-        };
+        let anchor = self
+            .viewport
+            .capture_anchor(&self.diff, &self.layout, self.focus_side, line_h);
 
         let started = Instant::now();
         self.diff = if self.config.single_pane {
@@ -375,15 +365,8 @@ impl DuiBi {
         };
 
         // Put that line back where it was.
-        if let Some(line) = anchor
-            && let Some(row) = self.diff.row_of(self.focus_side, line)
-        {
-            let y = self.layout.row_top(row, line_h);
-            if (y - self.scroll.y).abs() > 0.5 {
-                self.scroll.y = y;
-                self.pending_scroll = Some(self.scroll);
-            }
-        }
+        self.viewport
+            .restore_anchor(anchor, &self.diff, &self.layout, line_h);
     }
 
     /// Options changed: force a comparison on the next tick.
@@ -408,7 +391,14 @@ impl DuiBi {
         };
         let row = hunk.rows.start;
         self.focused_hunk = Some(index);
-        self.scroll_to_row = Some(row);
+        let line_h = self.editor_style().line_height;
+        self.viewport.scroll_to_row(
+            row,
+            Reveal::Centre,
+            &self.layout,
+            line_h,
+            self.viewport_height,
+        );
 
         // Put the caret on the hunk so the next Tab/typing lands where the user
         // is looking, and so "diff N of M" in the status bar agrees.
@@ -823,7 +813,7 @@ impl eframe::App for DuiBi {
         self.draw_central(ui, &mut actions);
         // Both panes have reported their heights; fold them in for next frame.
         self.layout.commit_measurements();
-        self.clear_scroll_requests();
+        self.viewport.end_frame();
         self.draw_overlays(ui, &mut actions);
 
         // Handle dropped files: dragging a file onto the window loads it into
@@ -843,8 +833,7 @@ impl eframe::App for DuiBi {
         if self.config.single_pane != before_single {
             // The row list is about to change shape, and a stale scroll offset
             // into the old one would land somewhere arbitrary.
-            self.scroll = Vec2::ZERO;
-            self.scroll_master = None;
+            self.viewport.reset();
             self.focused_hunk = None;
         }
         if self.config.word_wrap != before_wrap {
@@ -986,7 +975,16 @@ impl DuiBi {
         self.pane_mut(side)
             .buffer
             .set_selection(crate::core::text::Selection { anchor, head });
-        self.scroll_to_row = self.diff.row_of(side, m.line);
+        if let Some(row) = self.diff.row_of(side, m.line) {
+            let line_h = self.editor_style().line_height;
+            self.viewport.scroll_to_row(
+                row,
+                Reveal::Centre,
+                &self.layout,
+                line_h,
+                self.viewport_height,
+            );
+        }
         self.focus_side = side;
     }
 
@@ -1036,15 +1034,20 @@ impl DuiBi {
             .frame(egui::Frame::new().fill(palette.bg))
             .show(ui, |ui| {
             if self.config.single_pane {
+                self.viewport_height = ui.available_height();
                 // One editor, full width, no gutter and no overview.
                 let out = ui
                     .vertical(|ui| self.draw_pane(ui, Side::Left, &style, &palette, lang))
                     .inner;
+                let previous = [self.left.last_offset, self.right.last_offset];
+                self.viewport.observe(Some(out.offset), None, previous);
                 self.left.last_offset = out.offset;
-                self.scroll = out.offset;
                 self.focus_side = Side::Left;
                 return;
             }
+
+            // How much of the document fits on screen, so a jump can centre.
+            self.viewport_height = ui.available_height();
 
             let total_w = ui.available_width();
             let overview_w = if self.config.show_overview {
@@ -1080,7 +1083,7 @@ impl DuiBi {
                     &self.layout,
                     &palette,
                     style.line_height,
-                    self.scroll.y,
+                    self.viewport.offset().y,
                     self.focused_hunk,
                     !self.diff_dirty,
                 );
@@ -1097,7 +1100,10 @@ impl DuiBi {
                 // ---- Overview strip ------------------------------------
                 if self.config.show_overview {
                     let total_rows = self.diff.rows.len().max(1) as f32;
-                    let first = self.layout.row_at(self.scroll.y, style.line_height) as f32;
+                    let first = self
+                        .layout
+                        .row_at(self.viewport.offset().y, style.line_height)
+                        as f32;
                     let visible =
                         (ui.available_height() / style.line_height).max(1.0);
                     let params = OverviewParams {
@@ -1108,7 +1114,14 @@ impl DuiBi {
                         focused_hunk: self.focused_hunk,
                     };
                     if let Some(row) = show_overview(ui, params) {
-                        self.scroll_to_row = Some(row);
+                        let line_h = style.line_height;
+                        self.viewport.scroll_to_row(
+                            row,
+                            Reveal::Centre,
+                            &self.layout,
+                            line_h,
+                            self.viewport_height,
+                        );
                     }
                 }
 
@@ -1131,8 +1144,9 @@ impl DuiBi {
     /// Decide which pane drove the scroll this frame and record the shared
     /// offset the other one should adopt next frame.
     fn sync_scroll(&mut self, left: PaneFrame, right: PaneFrame) {
-        let left_moved = (left.offset - self.left.last_offset).length() > 0.5;
-        let right_moved = (right.offset - self.right.last_offset).length() > 0.5;
+        let previous = [self.left.last_offset, self.right.last_offset];
+        self.viewport
+            .observe(Some(left.offset), Some(right.offset), previous);
 
         self.left.last_offset = left.offset;
         self.right.last_offset = right.offset;
@@ -1142,19 +1156,6 @@ impl DuiBi {
         } else if right.focused {
             self.focus_side = Side::Right;
         }
-
-        self.scroll_master = if left_moved {
-            Some(Side::Left)
-        } else if right_moved {
-            Some(Side::Right)
-        } else {
-            None
-        };
-        self.scroll = match self.scroll_master {
-            Some(Side::Left) => left.offset,
-            Some(Side::Right) => right.offset,
-            None => self.scroll,
-        };
 
         // Keep the "current hunk" readout following the caret.
         let row = self.caret_row(self.focus_side);
@@ -1357,7 +1358,10 @@ impl DuiBi {
         let rows = if last.is_empty() {
             let height = 1200.0;
             self.layout
-                .visible_rows(self.scroll.y..self.scroll.y + height, style.line_height)
+                .visible_rows(
+                    self.viewport.offset().y..self.viewport.offset().y + height,
+                    style.line_height,
+                )
         } else {
             last
         };
@@ -1385,42 +1389,8 @@ impl DuiBi {
     }
 
     /// The scroll offset this pane should be forced to, if any.
-    ///
-    /// Pending requests are cleared once per frame by [`Self::clear_scroll_requests`]
-    /// rather than by whichever pane happens to read them last - the right pane
-    /// is not drawn at all in single-document mode, which used to leave a jump
-    /// request set forever and pin the view in place.
-    fn desired_offset(&self, side: Side, style: &EditorStyle) -> Option<Vec2> {
-        if let Some(row) = self.scroll_to_row {
-            return Some(Vec2::new(self.scroll.x, self.centred_on(row, style)));
-        }
-        if let Some(offset) = self.pending_scroll {
-            return Some(offset);
-        }
-        if !self.config.sync_scroll {
-            return None;
-        }
-        match self.scroll_master {
-            Some(master) if master != side => Some(self.scroll),
-            _ => None,
-        }
-    }
-
-    /// Offset that puts `row` in the middle of the viewport.
-    fn centred_on(&self, row: usize, style: &EditorStyle) -> f32 {
-        let y = self.layout.row_top(row, style.line_height);
-        (y - style.line_height * 6.0).max(0.0)
-    }
-
-    /// Consume this frame's scroll requests, after both panes have seen them.
-    fn clear_scroll_requests(&mut self) {
-        let style = self.editor_style();
-        if let Some(row) = self.scroll_to_row.take() {
-            self.scroll.y = self.centred_on(row, &style);
-        }
-        if let Some(offset) = self.pending_scroll.take() {
-            self.scroll = offset;
-        }
+    fn desired_offset(&self, side: Side, _style: &EditorStyle) -> Option<Vec2> {
+        self.viewport.forced_offset(side, self.config.sync_scroll)
     }
 
     fn draw_overlays(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
