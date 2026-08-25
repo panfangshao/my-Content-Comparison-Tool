@@ -9,6 +9,10 @@
 //! of the text per frame. A 10k-line file meant tens of thousands of string
 //! allocations between one frame and the next. Nothing about the output looked
 //! wrong, so only a measurement catches it.
+//!
+//! It also drives syntax highlighting, because the first version of this test
+//! passed `highlights: &[]` and so measured a frame that never happened. The
+//! real path was costing 60 ms per pane and this test said 143 us.
 
 use std::time::{Duration, Instant};
 
@@ -18,6 +22,7 @@ use duibi::core::diff::{Budget, DiffOptions, DiffResult, Side, diff_lines};
 use duibi::core::text::TextBuffer;
 use duibi::ui::editing::VerticalMotion;
 use duibi::ui::editor::{EditorStyle, InlineCache, PaneParams, show_pane};
+use duibi::ui::highlight::{PaneHighlighter, SyntaxAssets};
 use duibi::ui::rowlayout::RowLayout;
 use duibi::ui::theme::Palette;
 
@@ -42,6 +47,8 @@ struct Harness {
     palette: Palette,
     longest: usize,
     first: bool,
+    assets: std::sync::Arc<SyntaxAssets>,
+    highlighters: [PaneHighlighter; 2],
 }
 
 impl Harness {
@@ -81,6 +88,14 @@ impl Harness {
             palette: Palette::dark(),
             longest,
             first: true,
+            assets: SyntaxAssets::load(),
+            highlighters: {
+                let mut a = PaneHighlighter::new();
+                let mut b = PaneHighlighter::new();
+                a.set_syntax(Some("Rust"));
+                b.set_syntax(Some("Rust"));
+                [a, b]
+            },
         }
     }
 
@@ -100,6 +115,19 @@ impl Harness {
         let (diff, layout, inline) = (&self.diff, &mut self.layout, &mut self.inline);
         let (style, palette, longest) = (&self.style, &self.palette, self.longest);
         let opts = DiffOptions::default();
+
+        // Highlight the rows about to be drawn, as the application does.
+        let first_row = (scroll_y / style.line_height) as usize;
+        let rows = first_row..(first_row + 60).min(diff.rows.len());
+        let (assets, highlighters) = (&self.assets, &mut self.highlighters);
+        let hl: Vec<Vec<_>> = [Side::Left, Side::Right]
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let src = if i == 0 { left.lines() } else { right.lines() };
+                highlighters[i].highlight(assets, "base16-ocean.dark", src, rows.clone())
+            })
+            .collect();
 
         let mut out = self.ctx.run_ui(input, |ui| {
             ui.horizontal(|ui| {
@@ -122,8 +150,8 @@ impl Harness {
                                 inline,
                                 palette,
                                 style,
-                                highlights: &[],
-                                highlight_rows: 0..0,
+                                highlights: &hl[usize::from(side == Side::Right)],
+                                highlight_rows: rows.clone(),
                                 search: &[],
                                 active_match: None,
                                 longest_line: longest,

@@ -22,9 +22,26 @@
 //! Edits only discard the checkpoints *after* the edited line (see
 //! `TextBuffer::min_dirty_line`), so typing at line 90 000 does not throw away
 //! the work done for lines 0..90 000.
+//!
+//! # Why the result is cached
+//!
+//! Rewinding is bounded but not cheap: up to [`STRIDE`] lines of re-parsing for
+//! every window drawn. Doing that on every frame cost 60 ms per pane on a
+//! 14 000-line file - 120 ms for the two of them, against a 16 ms budget - and
+//! made scrolling and even caret movement visibly lag.
+//!
+//! So a padded window is kept: scrolling anywhere inside it is free, and only
+//! leaving it pays for a rewind. Editing or changing the theme drops it.
+//!
+//! The window is filled in across frames too, for the same reason the
+//! checkpoints are. Parsing a whole padded window at once is another 500-odd
+//! lines, which is another dropped frame - just moved to the moment the colour
+//! finally lands rather than to the scroll that asked for it. Every frame here
+//! is bounded by [`CATCHUP_SLICE`]; nothing is ever parsed twice.
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use egui::Color32;
 use syntect::highlighting::{
@@ -34,11 +51,27 @@ use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 
 /// Lines between parser snapshots. 512 keeps the rewind cost small while
 /// holding the checkpoint list to ~200 entries for a 100k-line file.
-const STRIDE: usize = 512;
+const STRIDE: usize = 256;
 
-/// Lines we are willing to parse in one frame while catching up. Sized to stay
-/// under a millisecond or two on ordinary source files.
-const CATCHUP_BUDGET: usize = 4096;
+/// Extra lines parsed above and below the window actually asked for.
+///
+/// This is what makes scrolling free: a frame only pays for parsing when the
+/// view leaves the padded region. Larger means fewer rebuilds and more work per
+/// rebuild; 256 covers several screens in either direction.
+const CACHE_PAD: usize = 256;
+
+/// How long one frame may spend building checkpoints.
+///
+/// This used to be a line count, and that does not bound anything useful: how
+/// long a line takes to parse varies by an order of magnitude between languages
+/// and line lengths. A budget of 4096 lines turned into a 661 ms frame on a
+/// 14 000-line Rust file - a visible freeze on the first scroll into the middle
+/// of a document. Time is the thing being rationed, so time is what is counted.
+const CATCHUP_SLICE: Duration = Duration::from_millis(8);
+
+/// Lines parsed between clock readings. Reading the clock per line would itself
+/// show up in the measurement.
+const CLOCK_EVERY: usize = 32;
 
 /// Above this many lines we do not highlight at all. Past this point the file
 /// is machine-generated far more often than not, and the checkpoint list plus
@@ -142,6 +175,34 @@ pub struct PaneHighlighter {
     /// Set when the last request could not be satisfied within the budget, so
     /// the app knows to schedule another frame.
     catching_up: bool,
+    /// The last window parsed, kept so that scrolling within it costs nothing.
+    cache: Option<CachedWindow>,
+    /// Work part-way through the next checkpoint, carried across frames.
+    ///
+    /// Without this, a frame that runs out of time would throw away everything
+    /// it had parsed, and a slice shorter than one checkpoint could never
+    /// finish one at all.
+    partial: Option<Partial>,
+}
+
+/// A checkpoint under construction: the state so far, and the next line to feed
+/// it.
+struct Partial {
+    next_line: usize,
+    state: Checkpoint,
+}
+
+/// A window being parsed, or already parsed.
+///
+/// `styles` is sized for the whole window from the start; entries at or past
+/// `filled_to` are placeholders until the frames that fill them arrive.
+struct CachedWindow {
+    lines: Range<usize>,
+    styles: Vec<Vec<StyledRange>>,
+    /// Absolute line index parsed up to. Equal to `lines.end` when complete.
+    filled_to: usize,
+    /// Parser state sitting at `filled_to`, kept while the window is unfinished.
+    state: Option<Box<Checkpoint>>,
 }
 
 impl Default for PaneHighlighter {
@@ -158,6 +219,8 @@ impl PaneHighlighter {
             checkpoints: Vec::new(),
             parsed_upto: 0,
             catching_up: false,
+            cache: None,
+            partial: None,
         }
     }
 
@@ -182,6 +245,8 @@ impl PaneHighlighter {
     fn reset(&mut self) {
         self.checkpoints.clear();
         self.parsed_upto = 0;
+        self.cache = None;
+        self.partial = None;
     }
 
     /// Discard the checkpoints covering `line` and everything after it.
@@ -193,6 +258,14 @@ impl PaneHighlighter {
         if keep < self.checkpoints.len() {
             self.checkpoints.truncate(keep);
             self.parsed_upto = keep * STRIDE;
+            self.partial = None;
+        } else if self.partial.as_ref().is_some_and(|p| p.next_line > line) {
+            // The half-built checkpoint had already read past the edit.
+            self.partial = None;
+        }
+        // The cached window is only good up to the edit.
+        if self.cache.as_ref().is_some_and(|c| c.lines.end > line) {
+            self.cache = None;
         }
     }
 
@@ -226,8 +299,38 @@ impl PaneHighlighter {
             self.reset();
         }
 
+        // Already parsed? Then this frame costs nothing.
+        if let Some(hit) = self.cached(&range) {
+            self.catching_up = false;
+            return hit;
+        }
+
         let theme = assets.theme(theme_name);
         let highlighter = Highlighter::new(theme);
+        let deadline = Instant::now() + CATCHUP_SLICE;
+
+        // The window in hand may already cover this range but not have reached
+        // it yet; carry on filling it rather than starting over.
+        if self.extend_window(&range, lines, &highlighter, &assets.syntaxes, deadline) {
+            self.catching_up = false;
+            return self
+                .cached(&range)
+                .unwrap_or_else(|| vec![Vec::new(); range.len()]);
+        }
+        if self.cache.as_ref().is_some_and(|c| {
+            range.start >= c.lines.start && range.end <= c.lines.end
+        }) {
+            // Same window, still filling. Draw plain and come back next frame.
+            self.catching_up = true;
+            return empty();
+        }
+
+        // Parse a padded window, not just what was asked for, so the next few
+        // hundred lines of scrolling are served from the cache.
+        let wanted = range.clone();
+        let range = range.start.saturating_sub(CACHE_PAD)
+            ..(range.end + CACHE_PAD).min(lines.len());
+
         let end = range.end.min(lines.len());
         if range.start >= end {
             return empty();
@@ -244,28 +347,50 @@ impl PaneHighlighter {
             self.parsed_upto = 0;
         }
 
-        let mut budget = CATCHUP_BUDGET;
         while self.checkpoints.len() <= needed {
-            let mut cp = self
-                .checkpoints
-                .last()
-                .expect("pushed above")
-                .clone();
-            let from = (self.checkpoints.len() - 1) * STRIDE;
-            let to = (from + STRIDE).min(lines.len());
-            if from >= lines.len() {
+            let chunk_start = (self.checkpoints.len() - 1) * STRIDE;
+            if chunk_start >= lines.len() {
                 break;
             }
-            if budget == 0 {
-                // Out of time. Draw plain this frame and continue next frame.
-                self.catching_up = true;
-                return empty();
-            }
-            budget = budget.saturating_sub(to - from);
+            let chunk_end = (chunk_start + STRIDE).min(lines.len());
 
-            for line in &lines[from..to] {
-                advance(&mut cp, line, &highlighter, &assets.syntaxes);
+            // Resume the checkpoint this ran out of time on last frame, or
+            // start a fresh one from the previous checkpoint.
+            let mut partial = self.partial.take().filter(|p| {
+                (chunk_start..chunk_end).contains(&p.next_line)
+            });
+            let (mut cursor, mut cp) = match partial.take() {
+                Some(p) => (p.next_line, p.state),
+                None => (
+                    chunk_start,
+                    self.checkpoints.last().expect("pushed above").clone(),
+                ),
+            };
+
+            let mut since_clock = 0usize;
+            while cursor < chunk_end {
+                advance(&mut cp, &lines[cursor], &highlighter, &assets.syntaxes);
+                cursor += 1;
+                since_clock += 1;
+
+                if since_clock >= CLOCK_EVERY {
+                    since_clock = 0;
+                    // Only stop if this chunk still has work left. Bailing out
+                    // with the chunk *complete* would save a `next_line` equal
+                    // to its end, which no chunk range contains - so the next
+                    // frame would throw the whole chunk away and start it
+                    // again. That alone cost 3.5x the necessary parsing.
+                    if cursor < chunk_end && Instant::now() >= deadline {
+                        self.partial = Some(Partial {
+                            next_line: cursor,
+                            state: cp,
+                        });
+                        self.catching_up = true;
+                        return empty();
+                    }
+                }
             }
+
             self.checkpoints.push(cp);
             self.parsed_upto = self.checkpoints.len().saturating_sub(1) * STRIDE;
         }
@@ -275,22 +400,89 @@ impl PaneHighlighter {
             return empty();
         };
 
-        // ---- 2. Re-parse from the checkpoint up to the window --------------
-        let mut cp = start_cp.clone();
+        // ---- 2. Start the window at the checkpoint itself -------------------
+        //
+        // The lines between the checkpoint and the window used to be re-parsed
+        // in one go, and that was the last unbounded stretch in this function -
+        // up to `STRIDE` lines, tens of milliseconds, in whichever frame
+        // happened to ask. Making the window start at the checkpoint folds
+        // those lines into the time-sliced fill below, and their colours end up
+        // cached rather than thrown away.
+        let cp = start_cp.clone();
         let cp_line = needed * STRIDE;
-        for line in &lines[cp_line..range.start] {
-            advance(&mut cp, line, &highlighter, &assets.syntaxes);
-        }
+        let span = cp_line..end;
+        self.cache = Some(CachedWindow {
+            styles: vec![Vec::new(); span.len()],
+            filled_to: span.start,
+            lines: span,
+            state: Some(Box::new(cp)),
+        });
 
-        // ---- 3. Collect the styles for the window itself -------------------
-        let mut out = Vec::with_capacity(range.len());
-        for line in &lines[range.start..end] {
-            out.push(styles_for(&mut cp, line, &highlighter, &assets.syntaxes));
+        let complete = self.extend_window(
+            &wanted,
+            lines,
+            &highlighter,
+            &assets.syntaxes,
+            deadline,
+        );
+        if !complete {
+            self.catching_up = true;
+            return empty();
         }
-        // The caller expects one entry per requested line even if the document
-        // is shorter than the window.
-        out.resize(range.len(), Vec::new());
-        out
+        self.cached(&wanted).unwrap_or_else(|| vec![Vec::new(); wanted.len()])
+    }
+
+    /// Serve `range` out of the cached window, if it is inside the part that
+    /// has actually been parsed.
+    fn cached(&self, range: &Range<usize>) -> Option<Vec<Vec<StyledRange>>> {
+        let cache = self.cache.as_ref()?;
+        if range.start < cache.lines.start || range.end > cache.filled_to {
+            return None;
+        }
+        let from = range.start - cache.lines.start;
+        Some(cache.styles[from..from + range.len()].to_vec())
+    }
+
+    /// Spend up to one slice extending the current window, if there is one that
+    /// covers `wanted` but has not reached the end of it yet.
+    ///
+    /// Returns true when the window now covers `wanted`.
+    fn extend_window(
+        &mut self,
+        wanted: &Range<usize>,
+        lines: &[String],
+        highlighter: &Highlighter<'_>,
+        syntaxes: &SyntaxSet,
+        deadline: Instant,
+    ) -> bool {
+        let Some(cache) = self.cache.as_mut() else {
+            return false;
+        };
+        if wanted.start < cache.lines.start || wanted.end > cache.lines.end {
+            return false; // a different window is needed entirely
+        }
+        let Some(state) = cache.state.as_mut() else {
+            return cache.filled_to >= wanted.end;
+        };
+
+        let mut since_clock = 0usize;
+        while cache.filled_to < cache.lines.end {
+            let index = cache.filled_to - cache.lines.start;
+            cache.styles[index] = styles_for(state, &lines[cache.filled_to], highlighter, syntaxes);
+            cache.filled_to += 1;
+            since_clock += 1;
+
+            if since_clock >= CLOCK_EVERY {
+                since_clock = 0;
+                if cache.filled_to < cache.lines.end && Instant::now() >= deadline {
+                    break;
+                }
+            }
+        }
+        if cache.filled_to >= cache.lines.end {
+            cache.state = None; // finished; the parser state is no longer needed
+        }
+        cache.filled_to >= wanted.end
     }
 }
 
@@ -337,6 +529,25 @@ mod tests {
 
     fn assets() -> Arc<SyntaxAssets> {
         SyntaxAssets::load()
+    }
+
+    /// Drive a highlighter to completion, as the application does by asking for
+    /// another frame whenever `is_catching_up` is set.
+    fn settle(
+        h: &mut PaneHighlighter,
+        a: &SyntaxAssets,
+        theme: &str,
+        lines: &[String],
+        range: Range<usize>,
+    ) -> Vec<Vec<StyledRange>> {
+        let mut out = h.highlight(a, theme, lines, range.clone());
+        for _ in 0..2_000 {
+            if !h.is_catching_up() {
+                return out;
+            }
+            out = h.highlight(a, theme, lines, range.clone());
+        }
+        panic!("highlighting never settled");
     }
 
     fn rust_lines(n: usize) -> Vec<String> {
@@ -420,17 +631,11 @@ mod tests {
         let mut jumped = PaneHighlighter::new();
         jumped.set_syntax(Some("Rust"));
         // Give it enough frames to build the checkpoint chain.
-        let mut from_jump = Vec::new();
-        for _ in 0..10 {
-            from_jump = jumped.highlight(&a, "base16-ocean.dark", &lines, window.clone());
-            if !jumped.is_catching_up() {
-                break;
-            }
-        }
+        let from_jump = settle(&mut jumped, &a, "base16-ocean.dark", &lines, window.clone());
 
         let mut sequential = PaneHighlighter::new();
         sequential.set_syntax(Some("Rust"));
-        let all = sequential.highlight(&a, "base16-ocean.dark", &lines, 0..lines.len());
+        let all = settle(&mut sequential, &a, "base16-ocean.dark", &lines, 0..lines.len());
 
         assert_eq!(from_jump, all[window], "checkpoint rewind changed the result");
         assert!(!from_jump.iter().all(Vec::is_empty));
@@ -450,17 +655,11 @@ mod tests {
         let target = lines.len() - 3;
         let mut h = PaneHighlighter::new();
         h.set_syntax(Some("Rust"));
-        let mut out = Vec::new();
-        for _ in 0..10 {
-            out = h.highlight(&a, "base16-ocean.dark", &lines, target..target + 1);
-            if !h.is_catching_up() {
-                break;
-            }
-        }
+        let out = settle(&mut h, &a, "base16-ocean.dark", &lines, target..target + 1);
 
         let mut seq = PaneHighlighter::new();
         seq.set_syntax(Some("Rust"));
-        let all = seq.highlight(&a, "base16-ocean.dark", &lines, 0..lines.len());
+        let all = settle(&mut seq, &a, "base16-ocean.dark", &lines, 0..lines.len());
         assert_eq!(out[0], all[target], "comment state was lost at a checkpoint");
     }
 
@@ -470,12 +669,7 @@ mod tests {
         let lines = rust_lines(3000);
         let mut h = PaneHighlighter::new();
         h.set_syntax(Some("Rust"));
-        for _ in 0..10 {
-            h.highlight(&a, "base16-ocean.dark", &lines, 2500..2520);
-            if !h.is_catching_up() {
-                break;
-            }
-        }
+        settle(&mut h, &a, "base16-ocean.dark", &lines, 2500..2520);
         let before = h.checkpoints.len();
         assert!(before > 4);
 
@@ -488,6 +682,178 @@ mod tests {
 
         h.invalidate_from(0);
         assert!(h.checkpoints.is_empty());
+    }
+
+    /// Scrolling through a file must give the same colours as parsing it
+    /// straight through - the cache must never serve a stale or misaligned
+    /// window.
+    #[test]
+    fn scrolling_across_the_cache_matches_a_sequential_parse() {
+        let a = assets();
+        let lines = rust_lines(3_000);
+
+        let mut sequential = PaneHighlighter::new();
+        sequential.set_syntax(Some("Rust"));
+        let all = settle(&mut sequential, &a, "base16-ocean.dark", &lines, 0..lines.len());
+
+        let mut scrolled = PaneHighlighter::new();
+        scrolled.set_syntax(Some("Rust"));
+        // Walk down in small steps, as dragging a scrollbar would, crossing the
+        // padded window boundary many times.
+        for top in (0..2_800).step_by(37) {
+            let window = top..top + 60;
+            let got = settle(&mut scrolled, &a, "base16-ocean.dark", &lines, window.clone());
+            assert_eq!(got, all[window.clone()], "window {window:?} disagreed");
+        }
+    }
+
+    #[test]
+    fn an_edit_drops_a_cache_that_covers_it() {
+        let a = assets();
+        let lines = rust_lines(2_000);
+        let mut h = PaneHighlighter::new();
+        h.set_syntax(Some("Rust"));
+
+        settle(&mut h, &a, "base16-ocean.dark", &lines, 1_000..1_060);
+        assert!(h.cache.is_some(), "a window should have been cached");
+
+        // An edit past the window leaves it alone...
+        h.invalidate_from(1_900);
+        assert!(h.cache.is_some(), "an edit past the window is irrelevant");
+
+        // ...one inside it does not.
+        h.invalidate_from(1_010);
+        assert!(h.cache.is_none(), "the cache outlived an edit inside it");
+    }
+
+    #[test]
+    fn a_theme_change_is_not_served_from_the_cache() {
+        let a = assets();
+        let lines = rust_lines(500);
+        let mut h = PaneHighlighter::new();
+        h.set_syntax(Some("Rust"));
+
+        let dark = settle(&mut h, &a, "base16-ocean.dark", &lines, 0..60);
+        let light = settle(&mut h, &a, "InspiredGitHub", &lines, 0..60);
+        assert_ne!(dark, light, "the theme change was served from a stale cache");
+    }
+
+    #[test]
+    fn changing_the_language_is_not_served_from_the_cache() {
+        let a = assets();
+        let lines = rust_lines(500);
+        let mut h = PaneHighlighter::new();
+
+        h.set_syntax(Some("Rust"));
+        let as_rust = settle(&mut h, &a, "base16-ocean.dark", &lines, 0..40);
+        h.set_syntax(Some("Python"));
+        let as_python = settle(&mut h, &a, "base16-ocean.dark", &lines, 0..40);
+        assert_ne!(as_rust, as_python);
+    }
+
+    /// The reason the cache exists.
+    ///
+    /// Redrawing an already-parsed window used to rewind to the nearest
+    /// checkpoint and re-parse on every frame: 60 ms per pane on a 14 000-line
+    /// file, against a 16 ms budget for the whole frame.
+    #[test]
+    fn redrawing_a_parsed_window_is_effectively_free() {
+        use std::time::{Duration, Instant};
+
+        let a = assets();
+        let lines = rust_lines(14_000);
+        let mut h = PaneHighlighter::new();
+        h.set_syntax(Some("Rust"));
+
+        settle(&mut h, &a, "base16-ocean.dark", &lines, 9_000..9_060);
+
+        let start = Instant::now();
+        for i in 0..30 {
+            h.highlight(&a, "base16-ocean.dark", &lines, 9_000 + i..9_060 + i);
+        }
+        let per_frame = start.elapsed() / 30;
+
+        eprintln!("redraw with a warm cache: {per_frame:?} per pane");
+        assert!(
+            per_frame < Duration::from_millis(2),
+            "redrawing cost {per_frame:?} per pane; the cache is not being hit"
+        );
+    }
+
+    /// Catching up must not redo work it has already done.
+    ///
+    /// The time slice originally saved its progress *after* incrementing the
+    /// cursor, so a chunk that finished exactly as the deadline fired stored a
+    /// position no chunk range contained - and the next frame started that
+    /// chunk again. It cost 3.5x the necessary parsing and turned a 2-second
+    /// catch-up into 13.
+    #[test]
+    fn catching_up_makes_steady_progress() {
+        let a = assets();
+        let lines = rust_lines(4_000);
+        let mut h = PaneHighlighter::new();
+        h.set_syntax(Some("Rust"));
+
+        let mut frames = 0;
+        while h.is_catching_up() || frames == 0 {
+            h.highlight(&a, "base16-ocean.dark", &lines, 3_000..3_060);
+            frames += 1;
+            assert!(frames < 400, "catch-up is not converging");
+        }
+
+        // Every frame must have advanced the chain; if any threw its work away
+        // the count would be far higher than the lines actually needed.
+        assert!(
+            h.checkpoints.len() * STRIDE >= 2_816,
+            "the checkpoint chain did not reach the window"
+        );
+        eprintln!("caught up to line 3000 in {frames} frames");
+    }
+
+    /// A single frame must never block, however far the jump.
+    #[test]
+    fn no_single_frame_blocks_while_catching_up() {
+        use std::time::Instant;
+
+        let a = assets();
+        let lines = rust_lines(14_000);
+        let mut h = PaneHighlighter::new();
+        h.set_syntax(Some("Rust"));
+
+        // Counted rather than maxed: a single scheduling hiccup on a loaded
+        // machine can stretch any one frame, and asserting on the maximum only
+        // measures how busy the build agent is. What matters is whether frames
+        // are *systematically* over budget, which is what an unbounded phase
+        // would look like.
+        const OVER_BUDGET: Duration = Duration::from_millis(40);
+        let mut over = 0;
+        let mut frames = 0;
+        let mut total = Duration::ZERO;
+        loop {
+            let start = Instant::now();
+            h.highlight(&a, "base16-ocean.dark", &lines, 9_000..9_060);
+            let took = start.elapsed();
+            total += took;
+            over += usize::from(took > OVER_BUDGET);
+            frames += 1;
+            if !h.is_catching_up() || frames > 600 {
+                break;
+            }
+        }
+
+        eprintln!(
+            "caught up in {frames} frames, {:?} average, {over} over {OVER_BUDGET:?}",
+            total / frames
+        );
+        assert!(
+            over <= 2,
+            "{over} of {frames} frames ran over {OVER_BUDGET:?}; a phase is not              respecting the time slice"
+        );
+        assert!(
+            total / frames < Duration::from_millis(20),
+            "the average frame was {:?}",
+            total / frames
+        );
     }
 
     #[test]

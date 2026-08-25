@@ -175,6 +175,8 @@ pub struct DuiBi {
     /// Height of one pane, recorded while drawing so a jump knows how much of
     /// the document fits on screen.
     viewport_height: f32,
+    /// Set when work was deferred to a later frame and one must be scheduled.
+    needs_repaint: bool,
     focused_hunk: Option<usize>,
 
     /// Screen x where the left pane ends and the right one begins, recorded
@@ -220,6 +222,7 @@ impl DuiBi {
             show_shortcuts: false,
             viewport: Viewport::default(),
             viewport_height: 600.0,
+            needs_repaint: false,
             focused_hunk: None,
             pane_boundary_x: f32::INFINITY,
             hover_drop_x: None,
@@ -850,6 +853,9 @@ impl eframe::App for DuiBi {
             self.run(&ctx, action);
         }
 
+        if std::mem::take(&mut self.needs_repaint) {
+            ctx.request_repaint();
+        }
         self.update_title(&ctx);
     }
 
@@ -1339,6 +1345,10 @@ impl DuiBi {
             pane.buffer.lines(),
             lines.clone(),
         );
+        // Building the checkpoint chain is spread over frames. Without asking
+        // for the next one, colouring would stall part-way through and only
+        // resume when the user happened to move the mouse.
+        let catching_up = pane.highlighter.is_catching_up();
 
         // Re-key from lines back to rows, so the editor can index by row.
         let mut out = vec![Vec::new(); rows.len()];
@@ -1350,6 +1360,9 @@ impl DuiBi {
             {
                 out[i] = per_line[line - lines.start].clone();
             }
+        }
+        if catching_up {
+            self.needs_repaint = true;
         }
         (out, rows)
     }
