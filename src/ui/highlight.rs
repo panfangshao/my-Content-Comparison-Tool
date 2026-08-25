@@ -177,6 +177,13 @@ pub struct PaneHighlighter {
     catching_up: bool,
     /// The last window parsed, kept so that scrolling within it costs nothing.
     cache: Option<CachedWindow>,
+    /// Lines fed to the parser since this counter was last read.
+    ///
+    /// The time slice cannot be tested with a clock: the assertion would
+    /// measure how loaded the machine is, and it failed exactly that way when
+    /// run beside 300 other tests. Work done is the thing being rationed, and
+    /// counting it is load-independent. One integer add per line.
+    parsed_this_frame: usize,
     /// Work part-way through the next checkpoint, carried across frames.
     ///
     /// Without this, a frame that runs out of time would throw away everything
@@ -220,6 +227,7 @@ impl PaneHighlighter {
             parsed_upto: 0,
             catching_up: false,
             cache: None,
+            parsed_this_frame: 0,
             partial: None,
         }
     }
@@ -274,6 +282,14 @@ impl PaneHighlighter {
     /// Returns empty vectors (meaning "draw in the plain foreground colour")
     /// when highlighting is off, the file is too large, or the parser has not
     /// caught up to this part of the file yet.
+    /// Lines fed to the parser during the last [`Self::highlight`] call.
+    ///
+    /// Exposed so the time slice can be checked by the work it lets through
+    /// rather than by a stopwatch. See [`Self::parsed_this_frame`].
+    pub fn parsed_last_frame(&self) -> usize {
+        self.parsed_this_frame
+    }
+
     pub fn highlight(
         &mut self,
         assets: &SyntaxAssets,
@@ -282,6 +298,7 @@ impl PaneHighlighter {
         range: Range<usize>,
     ) -> Vec<Vec<StyledRange>> {
         let empty = || vec![Vec::new(); range.len()];
+        self.parsed_this_frame = 0;
 
         let Some(syntax_name) = self.syntax_name.clone() else {
             return empty();
@@ -370,6 +387,7 @@ impl PaneHighlighter {
             let mut since_clock = 0usize;
             while cursor < chunk_end {
                 advance(&mut cp, &lines[cursor], &highlighter, &assets.syntaxes);
+                self.parsed_this_frame += 1;
                 cursor += 1;
                 since_clock += 1;
 
@@ -469,6 +487,7 @@ impl PaneHighlighter {
         while cache.filled_to < cache.lines.end {
             let index = cache.filled_to - cache.lines.start;
             cache.styles[index] = styles_for(state, &lines[cache.filled_to], highlighter, syntaxes);
+            self.parsed_this_frame += 1;
             cache.filled_to += 1;
             since_clock += 1;
 
@@ -812,7 +831,7 @@ mod tests {
 
     /// A single frame must never block, however far the jump.
     #[test]
-    fn no_single_frame_blocks_while_catching_up() {
+    fn no_single_frame_does_an_unbounded_amount_of_parsing() {
         use std::time::Instant;
 
         let a = assets();
@@ -820,40 +839,47 @@ mod tests {
         let mut h = PaneHighlighter::new();
         h.set_syntax(Some("Rust"));
 
-        // Counted rather than maxed: a single scheduling hiccup on a loaded
-        // machine can stretch any one frame, and asserting on the maximum only
-        // measures how busy the build agent is. What matters is whether frames
-        // are *systematically* over budget, which is what an unbounded phase
-        // would look like.
-        const OVER_BUDGET: Duration = Duration::from_millis(40);
-        let mut over = 0;
+        // Measured in lines parsed, not milliseconds.
+        //
+        // A wall-clock assertion here measures how loaded the machine is, and
+        // it did exactly that: this test passed alone and failed when run
+        // beside 300 others. Lines parsed is what the time slice is actually
+        // rationing, and it does not move with load.
+        //
+        // The slice targets ~64 lines a frame at the ~125 us/line this parser
+        // costs. The bound is set far above that because a faster machine
+        // legitimately fits more into 8 ms - it is here to catch a phase that
+        // ignores the budget entirely, which is what the old 4096-line budget
+        // did when it produced a 661 ms freeze.
+        const UNBOUNDED: usize = 2_000;
+
         let mut frames = 0;
+        let mut worst = 0;
         let mut total = Duration::ZERO;
         loop {
             let start = Instant::now();
             h.highlight(&a, "base16-ocean.dark", &lines, 9_000..9_060);
-            let took = start.elapsed();
-            total += took;
-            over += usize::from(took > OVER_BUDGET);
+            total += start.elapsed();
+            worst = worst.max(h.parsed_last_frame());
             frames += 1;
+
+            assert!(
+                h.parsed_last_frame() <= UNBOUNDED,
+                "one frame parsed {} lines; a phase is ignoring the time slice",
+                h.parsed_last_frame()
+            );
             if !h.is_catching_up() || frames > 600 {
                 break;
             }
         }
 
+        // Timing is reported, not asserted, for the reason above. The
+        // integration benchmarks in `tests/` carry the frame-time thresholds.
         eprintln!(
-            "caught up in {frames} frames, {:?} average, {over} over {OVER_BUDGET:?}",
+            "caught up in {frames} frames, worst {worst} lines parsed,              {:?} average frame",
             total / frames
         );
-        assert!(
-            over <= 2,
-            "{over} of {frames} frames ran over {OVER_BUDGET:?}; a phase is not              respecting the time slice"
-        );
-        assert!(
-            total / frames < Duration::from_millis(20),
-            "the average frame was {:?}",
-            total / frames
-        );
+        assert!(frames > 1, "the work was not spread over frames at all");
     }
 
     #[test]

@@ -130,12 +130,16 @@ pub fn show_status_bar(
             );
 
             ui.separator();
+            // "共 N 行", not "N 行": this sits directly beside "行 L，列 C",
+            // and two segments both starting with 行 read as one repeated
+            // label rather than as a total and a position.
+            let lines = f.buffer.len_lines();
             ui.label(
-                RichText::new(format!(
-                    "{} {}",
-                    f.buffer.len_lines(),
-                    t(lang, "status.lines")
-                ))
+                RichText::new(if lines == 1 {
+                    t(lang, "status.lines_total_one").to_owned()
+                } else {
+                    tf(lang, "status.lines_total", &[("n", &lines.to_string())])
+                })
                 .color(palette.text_dim),
             );
 
@@ -321,7 +325,8 @@ mod tests {
             "status.modified",
             "status.similarity",
             "status.identical",
-            "status.lines",
+            "status.lines_total",
+            "status.lines_total_one",
             "status.ln_col",
             "status.selection",
             "status.diff_of",
@@ -332,6 +337,35 @@ mod tests {
                 assert!(!t(lang, key).is_empty(), "{key} missing for {lang:?}");
             }
         }
+    }
+
+    /// The line total sits immediately beside the caret position. When the
+    /// total read `1 行` and the position read `行 1，列 1`, the two ran
+    /// together as one repeated label - the 行 appeared to be printed twice.
+    ///
+    /// They have to be told apart at a glance, so they must not open with the
+    /// same character.
+    #[test]
+    fn the_line_total_does_not_read_as_the_caret_position() {
+        for lang in [Lang::Chinese, Lang::English] {
+            let total = t(lang, "status.lines_total_one");
+            let position = tf(lang, "status.ln_col", &[("l", "1"), ("c", "1")]);
+            assert_ne!(
+                total.chars().next(),
+                position.chars().next(),
+                "{lang:?}: `{total}` beside `{position}` reads as one label repeated"
+            );
+        }
+    }
+
+    /// `1 lines` was wrong; the phrasing has to work for a one-line document.
+    #[test]
+    fn the_line_total_reads_correctly_for_a_single_line() {
+        let english = t(Lang::English, "status.lines_total_one");
+        assert!(
+            !english.contains("1 lines"),
+            "`{english}` is ungrammatical for one line"
+        );
     }
 
     fn stats(unchanged: usize, modified: usize, total_lines: usize) -> DiffStats {
