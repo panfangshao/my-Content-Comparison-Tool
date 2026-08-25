@@ -55,6 +55,9 @@ pub struct Pane {
     last_visible: std::ops::Range<usize>,
     /// Column the caret is trying to hold while moving vertically.
     goal_column: Option<usize>,
+    /// Text an input method is composing into this pane, held out of the
+    /// document until it commits.
+    composing: crate::ui::ime::Composition,
     /// Longest line in characters, and the document version it was measured
     /// at. Sizing the horizontal scrollbar needs this, and measuring it is
     /// O(document) - far too expensive to redo on every frame.
@@ -73,6 +76,7 @@ impl Default for Pane {
             last_offset: Vec2::ZERO,
             last_visible: 0..0,
             goal_column: None,
+            composing: crate::ui::ime::Composition::default(),
             longest_line: 0,
             longest_line_version: None,
         }
@@ -1250,9 +1254,17 @@ impl DuiBi {
         let no_matches: Vec<crate::core::text::Match> = Vec::new();
         let search = if searching { &self.find.matches } else { &no_matches };
 
-        let (buffer, other_lines) = match side {
-            Side::Left => (&mut self.left.buffer, self.right.buffer.lines()),
-            Side::Right => (&mut self.right.buffer, self.left.buffer.lines()),
+        let (buffer, composing, other_lines) = match side {
+            Side::Left => (
+                &mut self.left.buffer,
+                &mut self.left.composing,
+                self.right.buffer.lines(),
+            ),
+            Side::Right => (
+                &mut self.right.buffer,
+                &mut self.right.composing,
+                self.left.buffer.lines(),
+            ),
         };
 
         let out = show_pane(
@@ -1276,6 +1288,7 @@ impl DuiBi {
                 force_offset,
                 focus_requested,
                 goal_column,
+                composing,
             },
         );
 

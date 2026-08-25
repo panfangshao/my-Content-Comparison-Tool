@@ -5,6 +5,7 @@ pub mod editor;
 pub mod find;
 pub mod gutter;
 pub mod highlight;
+pub mod ime;
 pub mod overview;
 pub mod rowlayout;
 pub mod statusbar;

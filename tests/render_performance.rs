@@ -129,6 +129,12 @@ impl Harness {
             })
             .collect();
 
+        // Never typed into; the pane just needs somewhere to keep it.
+        let mut composing = [
+            duibi::ui::ime::Composition::default(),
+            duibi::ui::ime::Composition::default(),
+        ];
+
         let mut out = self.ctx.run_ui(input, |ui| {
             ui.horizontal(|ui| {
                 for side in [Side::Left, Side::Right] {
@@ -158,6 +164,7 @@ impl Harness {
                                 force_offset: Some(Vec2::new(0.0, scroll_y)),
                                 focus_requested: false,
                                 goal_column: None,
+                                composing: &mut composing[usize::from(side == Side::Right)],
                             },
                         );
                     });

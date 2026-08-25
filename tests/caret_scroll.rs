@@ -38,6 +38,7 @@ struct Pane {
     diff: DiffResult,
     layout: RowLayout,
     inline: InlineCache,
+    composing: duibi::ui::ime::Composition,
     style: EditorStyle,
     palette: Palette,
     offset: Vec2,
@@ -68,6 +69,7 @@ impl Pane {
             diff,
             layout,
             inline: InlineCache::default(),
+            composing: duibi::ui::ime::Composition::default(),
             style: EditorStyle {
                 font: egui::FontId::monospace(14.0),
                 line_height: 20.0,
@@ -101,13 +103,14 @@ impl Pane {
         };
 
         let mut offset = self.offset;
-        let (buffer, diff, layout, inline, style, palette) = (
+        let (buffer, diff, layout, inline, style, palette, composing) = (
             &mut self.buffer,
             &self.diff,
             &mut self.layout,
             &mut self.inline,
             &self.style,
             &self.palette,
+            &mut self.composing,
         );
         let empty: Vec<String> = Vec::new();
 
@@ -133,6 +136,7 @@ impl Pane {
                     force_offset: None,
                     focus_requested,
                     goal_column: None,
+                    composing,
                 },
             );
             offset = result.offset;

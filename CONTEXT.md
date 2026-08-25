@@ -90,6 +90,11 @@ row 不会打断一个 hunk。
 ### Goal column（目标列）
 上下移动时光标想保持的列。必须跨帧保存——否则穿过一个短行就丢了。
 
+### Composition / pre-edit（输入法组合串 / 预编辑）
+用输入法打字时，「nihao」这段还没定下来的拼音就是 pre-edit（预编辑串）。
+它**不进文档**，存在 `ui::ime::Composition` 里，由编辑器画在光标处。
+只有 commit（上屏）才写进缓冲区。理由见下面第 7 条决定。
+
 ### Display column vs. line column（显示列 / 行内列）
 制表符展开成空格后位置会变。`tabs::to_display` / `from_display` 负责换算。
 命中测试和光标定位都走**真实排版出来的 galley**，不要用「字符宽度 × 列数」估算。
@@ -133,3 +138,12 @@ row 不会打断一个 hunk。
 
 6. **中日韩字体从系统加载** —— egui 自带字体没有 CJK 字形。附加为 fallback，
    Latin 仍用自带的等宽字体。
+
+7. **输入法预编辑串不进文档** —— egui 自带的 `TextEdit` 是把预编辑串直接插进
+   缓冲区再整段替换。这里不这么做，原因有三：每个拼音字母都会变成一条撤销记录；
+   每个字母都会让文档版本号 +1，从而把整份 14000 行的对比重跑一遍；光是「开始
+   打字又反悔」就会把文档标记成已修改。
+   预编辑串因此存在 `ui::ime::Composition`（不依赖 GUI 框架，可单测）。
+   另外：**编辑器每帧必须上报 IME 区域**（`PlatformOutput::ime`）。集成层用
+   `let allow_ime = ime.is_some();` 决定是否 `set_ime_allowed`——不上报就等于
+   把窗口的输入法关掉，中文一个字都打不进来。`tests/ime_input.rs` 守着这一点。

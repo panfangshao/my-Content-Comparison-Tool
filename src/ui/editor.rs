@@ -26,6 +26,7 @@ use crate::core::diff::{DiffOptions, DiffResult, InlineDiff, RowKind, Side, inli
 use crate::core::text::{Match, Selection, TextBuffer};
 use crate::ui::editing::{self, Motion, VerticalMotion};
 use crate::ui::highlight::StyledRange;
+use crate::ui::ime::{self, Composition};
 use crate::ui::rowlayout::RowLayout;
 use crate::ui::tabs;
 use crate::ui::theme::Palette;
@@ -127,6 +128,10 @@ pub struct PaneParams<'a> {
     /// the caller so it survives between frames - that is what lets Up/Down
     /// travel through a short line and come back out at the original column.
     pub goal_column: Option<usize>,
+    /// Text an input method is still composing. Owned by the caller for the
+    /// same reason as `goal_column`: composing `nihao` into `你好` spans many
+    /// frames. See [`crate::ui::ime`].
+    pub composing: &'a mut Composition,
 }
 
 pub struct PaneOutput {
@@ -164,6 +169,7 @@ pub fn show_pane(ui: &mut Ui, p: PaneParams<'_>) -> PaneOutput {
         force_offset,
         focus_requested,
         goal_column,
+        composing,
     } = p;
 
     inline.sync(diff_generation);
@@ -286,6 +292,10 @@ pub fn show_pane(ui: &mut Ui, p: PaneParams<'_>) -> PaneOutput {
         };
 
         let caret_line = buffer.line_of_char(buffer.selection().head);
+        // Where the input method should put its candidate window. Captured
+        // while the caret's row is laid out, because that is the only place the
+        // galley for it exists.
+        let mut ime_anchor: Option<Rect> = None;
 
         // ---- Rows -------------------------------------------------------
         for row_idx in rows.clone() {
@@ -380,10 +390,14 @@ pub fn show_pane(ui: &mut Ui, p: PaneParams<'_>) -> PaneOutput {
                 paint_whitespace(&text_painter, &ctx, &galley, origin, line);
             }
 
-            // ---- Caret --------------------------------------------------
+            // ---- Caret and any composition sitting on it ----------------
             if focused && line_idx == caret_line {
                 caret_row = Some(row_idx);
-                paint_caret(ui, &text_painter, &ctx, &galley, origin, line, buffer);
+                let caret = caret_rect(&ctx, &galley, origin, line, buffer);
+                if caret_is_showing(ui) {
+                    text_painter.rect_filled(caret, 0, palette.caret);
+                }
+                ime_anchor = Some(paint_composition(&text_painter, &ctx, composing, caret));
             }
 
         }
@@ -396,9 +410,36 @@ pub fn show_pane(ui: &mut Ui, p: PaneParams<'_>) -> PaneOutput {
         // ---- Input ------------------------------------------------------
         let caret_before = buffer.selection().head;
         if focused {
-            edited |= handle_keyboard(ui, buffer, style, &mut goal);
+            edited |= handle_keyboard(ui, buffer, style, &mut goal, composing);
+        }
+
+        // Moving the caret by hand, or losing focus, abandons whatever was
+        // being composed - the input method has no way to know the caret went
+        // somewhere else.
+        let mut interrupt = false;
+        if response.clicked() || response.drag_started() || !focused {
+            interrupt = composing.cancel();
         }
         handle_mouse(ui, &response, buffer, diff, layout, &ctx, &mut goal);
+
+        // ---- Tell the input method where to draw ------------------------
+        //
+        // This is also what *enables* it: the integration calls
+        // `set_ime_allowed` with whether this is set, so a pane that never
+        // reports an area cannot be typed into with an input method at all.
+        if focused {
+            let anchor = ime_anchor.unwrap_or_else(|| {
+                Rect::from_min_size(clip.min, Vec2::new(2.0, line_h))
+            });
+            ui.ctx().output_mut(|o| {
+                o.ime = Some(egui::output::IMEOutput {
+                    purpose: egui::IMEPurpose::Normal,
+                    rect: clip,
+                    cursor_rect: anchor,
+                    should_interrupt_composition: interrupt,
+                });
+            });
+        }
 
         // ---- Keep the caret on screen -----------------------------------
         //
@@ -719,36 +760,90 @@ fn paint_selection(
     paint_char_range(painter, galley, origin, from, to, ctx.palette.selection);
 }
 
-fn paint_caret(
-    ui: &Ui,
-    painter: &Painter,
+/// Where the caret sits on screen, whether or not it is currently blinking on.
+///
+/// Split out from the painting because the input method needs this rectangle
+/// every frame - it is what positions the candidate window - while the caret
+/// itself is only drawn for half of each blink.
+fn caret_rect(
     ctx: &RowCtx<'_>,
     galley: &Galley,
     origin: Pos2,
     line: &str,
     buffer: &TextBuffer,
-) {
+) -> Rect {
     let (_, col) = buffer.line_col(buffer.selection().head);
     let col = tabs::to_display(line, ctx.style.tab_width, col);
     let p = galley.pos_from_cursor(CCursor::new(col));
+    let x = (origin.x + p.min.x).round();
+    Rect::from_min_max(
+        pos2(x, origin.y + p.min.y),
+        pos2(x + 2.0, origin.y + p.max.y),
+    )
+}
 
-    // Blink on a 1.06 s cycle, and keep the frame clock running while focused.
+/// Whether the caret is visible this instant, keeping the blink clock running.
+fn caret_is_showing(ui: &Ui) -> bool {
     let t = ui.input(|i| i.time);
     ui.ctx()
         .request_repaint_after(std::time::Duration::from_millis(120));
-    if (t * 1.9).fract() > 0.5 {
-        return;
+    (t * 1.9).fract() <= 0.5
+}
+
+/// Draw the text an input method is still composing, and report where it ends.
+///
+/// The pre-edit is not in the document (see [`crate::ui::ime`]), so it is
+/// painted here over an opaque strip, in the conventional style: underlined
+/// throughout, with a heavier underline beneath the clause the input method has
+/// focus on.
+///
+/// Returns the rectangle the candidate window should be anchored to - the end
+/// of the pre-edit, so the candidate list follows what is being typed rather than
+/// sitting where composition began.
+fn paint_composition(
+    painter: &Painter,
+    ctx: &RowCtx<'_>,
+    composing: &Composition,
+    caret: Rect,
+) -> Rect {
+    let text = composing.text();
+    if text.is_empty() {
+        return caret;
     }
 
-    let x = (origin.x + p.min.x).round();
-    painter.rect_filled(
-        Rect::from_min_max(
-            pos2(x, origin.y + p.min.y),
-            pos2(x + 2.0, origin.y + p.max.y),
-        ),
-        0,
-        ctx.palette.caret,
+    let galley = painter.layout_no_wrap(
+        text.to_owned(),
+        ctx.style.font.clone(),
+        ctx.palette.text,
     );
+    let origin = pos2(caret.left(), caret.top());
+    let width = galley.size().x;
+    let box_rect = Rect::from_min_max(
+        origin,
+        pos2(origin.x + width, caret.bottom()),
+    );
+
+    // An opaque backdrop: the pre-edit floats above the line, so whatever text
+    // follows the caret must not show through it.
+    painter.rect_filled(box_rect.expand2(Vec2::new(1.0, 0.0)), 0, ctx.palette.editor_bg);
+    painter.galley(origin, galley.clone(), ctx.palette.text);
+
+    let underline = |from: f32, to: f32, thickness: f32| {
+        let y = box_rect.bottom() - thickness;
+        painter.rect_filled(
+            Rect::from_min_max(pos2(from, y), pos2(to, box_rect.bottom())),
+            0,
+            ctx.palette.accent,
+        );
+    };
+    underline(box_rect.left(), box_rect.right(), 1.0);
+
+    if let Some(active) = composing.active() {
+        let x = |chars: usize| origin.x + galley.pos_from_cursor(CCursor::new(chars)).min.x;
+        underline(x(active.start), x(active.end), 2.0);
+    }
+
+    Rect::from_min_max(pos2(box_rect.right(), caret.top()), box_rect.max)
 }
 
 fn paint_whitespace(
@@ -977,11 +1072,26 @@ fn handle_mouse(
 /// `goal` is the caret's remembered column. It belongs to the caller, not to
 /// this function: resetting it every frame is what made Up/Down forget the
 /// column as soon as it passed through a shorter line.
+/// Remove characters either side of the caret, at an input method's request.
+///
+/// Used by input methods that reconvert text already in the document rather
+/// than only appending - the surrounding characters are withdrawn so the
+/// commit can replace them.
+fn delete_around_caret(buffer: &mut TextBuffer, before_chars: usize, after_chars: usize) {
+    let head = buffer.selection().head;
+    let start = head.saturating_sub(before_chars);
+    let end = (head + after_chars).min(buffer.len_chars());
+    if start < end {
+        buffer.replace_range(start..end, "");
+    }
+}
+
 fn handle_keyboard(
     ui: &Ui,
     buffer: &mut TextBuffer,
     style: &EditorStyle,
     goal: &mut Option<usize>,
+    composing: &mut Composition,
 ) -> bool {
     use egui::{Event, Key};
 
@@ -997,6 +1107,37 @@ fn handle_keyboard(
                 // text that arrives here is real content.
                 buffer.insert(&text);
                 *goal = None;
+            }
+            // An input method never sends `Event::Text`. Chinese, Japanese and
+            // Korean input arrives only down this branch, as a run of pre-edits
+            // followed by a commit.
+            Event::Ime(event) => {
+                let step = match &event {
+                    egui::ImeEvent::Preedit {
+                        text,
+                        active_range_chars,
+                    } => Some(ime::Step::Preedit {
+                        text,
+                        active: active_range_chars.clone(),
+                    }),
+                    egui::ImeEvent::Commit(text) => Some(ime::Step::Commit(text)),
+                    egui::ImeEvent::DeleteSurrounding {
+                        before_chars,
+                        after_chars,
+                    } => {
+                        delete_around_caret(buffer, *before_chars, *after_chars);
+                        *goal = None;
+                        None
+                    }
+                    _ => None,
+                };
+                if let Some(step) = step
+                    && let ime::Outcome::Commit(text) = composing.apply(step)
+                    && !text.is_empty()
+                {
+                    buffer.insert(&text);
+                    *goal = None;
+                }
             }
             Event::Paste(text) => {
                 buffer.insert(&text);
