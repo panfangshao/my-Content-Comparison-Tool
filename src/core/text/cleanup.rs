@@ -19,22 +19,15 @@ pub enum CleanupOp {
     TrimBoth,
     /// Join everything into one line, separated by single spaces.
     NewlinesToSpaces,
-    Sort,
-    SortCaseInsensitive,
-    SortDescending,
     /// Sort and drop duplicates in one pass.
     SortUnique,
-    /// Reverse the line order.
-    Reverse,
-    ToLowercase,
-    ToUppercase,
     /// Collapse runs of internal whitespace to a single space, and trim.
     NormalizeWhitespace,
 }
 
 impl CleanupOp {
     /// Everything the Tools menu offers, in menu order.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 9] = [
         Self::RemoveDuplicates,
         Self::SortUnique,
         Self::RemoveEmptyLines,
@@ -44,12 +37,6 @@ impl CleanupOp {
         Self::TrimTrailing,
         Self::NormalizeWhitespace,
         Self::NewlinesToSpaces,
-        Self::Sort,
-        Self::SortCaseInsensitive,
-        Self::SortDescending,
-        Self::Reverse,
-        Self::ToLowercase,
-        Self::ToUppercase,
     ];
 
     /// Key for the one-line description shown on hover.
@@ -66,13 +53,7 @@ impl CleanupOp {
             Self::TrimTrailing => "tool.trim_trailing.help",
             Self::TrimBoth => "tool.trim_both.help",
             Self::NewlinesToSpaces => "tool.newlines_to_spaces.help",
-            Self::Sort => "tool.sort.help",
-            Self::SortCaseInsensitive => "tool.sort_ci.help",
-            Self::SortDescending => "tool.sort_desc.help",
             Self::SortUnique => "tool.sort_unique.help",
-            Self::Reverse => "tool.reverse.help",
-            Self::ToLowercase => "tool.lowercase.help",
-            Self::ToUppercase => "tool.uppercase.help",
             Self::NormalizeWhitespace => "tool.normalize_ws.help",
         }
     }
@@ -87,13 +68,7 @@ impl CleanupOp {
             Self::TrimTrailing => "tool.trim_trailing",
             Self::TrimBoth => "tool.trim_both",
             Self::NewlinesToSpaces => "tool.newlines_to_spaces",
-            Self::Sort => "tool.sort",
-            Self::SortCaseInsensitive => "tool.sort_ci",
-            Self::SortDescending => "tool.sort_desc",
             Self::SortUnique => "tool.sort_unique",
-            Self::Reverse => "tool.reverse",
-            Self::ToLowercase => "tool.lowercase",
-            Self::ToUppercase => "tool.uppercase",
             Self::NormalizeWhitespace => "tool.normalize_ws",
         }
     }
@@ -146,30 +121,12 @@ pub fn apply(op: CleanupOp, lines: &[String]) -> Vec<String> {
                 vec![joined]
             }
         }
-        CleanupOp::Sort => {
-            let mut v = lines.to_vec();
-            v.sort();
-            v
-        }
-        CleanupOp::SortCaseInsensitive => {
-            let mut v = lines.to_vec();
-            v.sort_by_key(|l| l.to_lowercase());
-            v
-        }
-        CleanupOp::SortDescending => {
-            let mut v = lines.to_vec();
-            v.sort_by(|a, b| b.cmp(a));
-            v
-        }
         CleanupOp::SortUnique => {
             let mut v = lines.to_vec();
             v.sort();
             v.dedup();
             v
         }
-        CleanupOp::Reverse => lines.iter().rev().cloned().collect(),
-        CleanupOp::ToLowercase => lines.iter().map(|l| l.to_lowercase()).collect(),
-        CleanupOp::ToUppercase => lines.iter().map(|l| l.to_uppercase()).collect(),
     }
 }
 
@@ -237,31 +194,9 @@ mod tests {
     }
 
     #[test]
-    fn sorting_variants() {
-        let input = v(&["b", "A", "a", "B"]);
-        assert_eq!(apply(CleanupOp::Sort, &input), v(&["A", "B", "a", "b"]));
-        assert_eq!(
-            apply(CleanupOp::SortDescending, &input),
-            v(&["b", "a", "B", "A"])
-        );
-        // Case-insensitive sort is stable, so equal keys keep input order.
-        assert_eq!(
-            apply(CleanupOp::SortCaseInsensitive, &input),
-            v(&["A", "a", "b", "B"])
-        );
-    }
-
-    #[test]
     fn sort_unique_sorts_and_dedupes() {
         let out = apply(CleanupOp::SortUnique, &v(&["c", "a", "b", "a", "c"]));
         assert_eq!(out, v(&["a", "b", "c"]));
-    }
-
-    #[test]
-    fn reverse_and_case_changes() {
-        assert_eq!(apply(CleanupOp::Reverse, &v(&["a", "b"])), v(&["b", "a"]));
-        assert_eq!(apply(CleanupOp::ToLowercase, &v(&["AbC"])), v(&["abc"]));
-        assert_eq!(apply(CleanupOp::ToUppercase, &v(&["AbC"])), v(&["ABC"]));
     }
 
     #[test]
@@ -294,9 +229,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn cjk_sorting_does_not_panic() {
-        let out = apply(CleanupOp::Sort, &v(&["工具", "对比", "文本"]));
-        assert_eq!(out.len(), 3);
-    }
 }

@@ -204,13 +204,7 @@ fn lookup(key: &str) -> (&'static str, &'static str) {
         "tool.trim_trailing" => ("去除行尾空白", "Trim Trailing Whitespace"),
         "tool.trim_both" => ("去除首尾空白", "Trim Whitespace"),
         "tool.newlines_to_spaces" => ("换行替换为空格", "Newlines to Spaces"),
-        "tool.sort" => ("排序", "Sort Lines"),
-        "tool.sort_ci" => ("排序（忽略大小写）", "Sort (Case Insensitive)"),
-        "tool.sort_desc" => ("倒序排序", "Sort Descending"),
         "tool.sort_unique" => ("排序并去重", "Sort and Deduplicate"),
-        "tool.reverse" => ("反转行序", "Reverse Lines"),
-        "tool.lowercase" => ("转为小写", "To Lowercase"),
-        "tool.uppercase" => ("转为大写", "To Uppercase"),
         "tool.normalize_ws" => ("规范化空白", "Normalize Whitespace"),
 
         // ---- Tool descriptions (shown on hover) --------------------------
@@ -253,30 +247,6 @@ fn lookup(key: &str) -> (&'static str, &'static str) {
         "tool.newlines_to_spaces.help" => (
             "把所有行接成一行，用单个空格连接；空行会被跳过。适合把硬换行的段落还原成整段文字。",
             "Join every line into one, separated by single spaces; blank lines are skipped. Useful for un-wrapping a hard-wrapped paragraph.",
-        ),
-        "tool.sort.help" => (
-            "按字典序升序排列。比较的是 Unicode 码位，所以大写字母会排在小写字母前面。",
-            "Sort ascending. Compares Unicode code points, so uppercase sorts before lowercase.",
-        ),
-        "tool.sort_ci.help" => (
-            "按字典序升序排列，忽略大小写；大小写不同但内容相同的行，保持原来的先后顺序。",
-            "Sort ascending, ignoring case. Lines that differ only in case keep their original relative order.",
-        ),
-        "tool.sort_desc.help" => (
-            "按字典序降序排列，也就是「排序」的反向。",
-            "Sort descending - the reverse of Sort Lines.",
-        ),
-        "tool.reverse.help" => (
-            "把行的顺序整个颠倒，第一行变成最后一行。不做任何排序。",
-            "Flip the order of the lines: the first becomes the last. Nothing is sorted.",
-        ),
-        "tool.lowercase.help" => (
-            "把所有字母转成小写，非字母字符不变。",
-            "Convert every letter to lowercase; anything else is left as it is.",
-        ),
-        "tool.uppercase.help" => (
-            "把所有字母转成大写，非字母字符不变。",
-            "Convert every letter to uppercase; anything else is left as it is.",
         ),
 
         // ---- Find bar ---------------------------------------------------
