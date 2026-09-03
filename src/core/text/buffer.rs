@@ -31,8 +31,6 @@ pub struct TextBuffer {
     /// The syntax highlighter uses it to keep the checkpoints before the edit
     /// instead of re-parsing the file from line 0 on every keystroke.
     min_dirty_line: usize,
-    /// Version at the last save / load, for the "unsaved changes" indicator.
-    saved_version: u64,
 }
 
 impl Default for TextBuffer {
@@ -56,7 +54,6 @@ impl TextBuffer {
             selection: Selection::at(0),
             version: 0,
             min_dirty_line: usize::MAX,
-            saved_version: 0,
         }
     }
 
@@ -116,13 +113,16 @@ impl TextBuffer {
         self.min_dirty_line = usize::MAX;
     }
 
+    /// Whether the text differs from the last save. Tracked by position in
+    /// the undo history rather than by version, so undo followed by redo back
+    /// to the saved state reads clean again.
     #[inline]
     pub fn is_dirty(&self) -> bool {
-        self.version != self.saved_version
+        self.history.is_dirty()
     }
 
     pub fn mark_saved(&mut self) {
-        self.saved_version = self.version;
+        self.history.mark_saved();
         self.history.break_run();
     }
 
@@ -326,7 +326,6 @@ impl TextBuffer {
         self.selection = Selection::at(0);
         self.version += 1;
         self.min_dirty_line = 0;
-        self.saved_version = self.version;
     }
 
     // ---- Undo / redo -----------------------------------------------------
@@ -638,6 +637,32 @@ mod tests {
         assert!(!b.is_dirty());
         assert!(b.undo());
         assert!(b.is_dirty(), "undoing past the save point is still dirty");
+    }
+
+    #[test]
+    fn undo_then_redo_back_to_the_save_point_is_clean() {
+        let mut b = TextBuffer::from_text("a");
+        b.insert("b");
+        b.mark_saved();
+        assert!(b.undo());
+        assert!(b.is_dirty());
+        assert!(b.redo());
+        assert!(!b.is_dirty(), "returning to the saved content reads clean");
+        check(&b);
+    }
+
+    #[test]
+    fn editing_after_undo_stays_dirty() {
+        let mut b = TextBuffer::from_text("a");
+        b.insert("b");
+        b.mark_saved();
+        assert!(b.undo());
+        b.break_undo_run();
+        b.insert("c");
+        assert!(b.is_dirty(), "a divergent edit must not read as saved");
+        assert!(b.undo());
+        assert!(b.is_dirty(), "the saved state is no longer reachable");
+        check(&b);
     }
 
     #[test]

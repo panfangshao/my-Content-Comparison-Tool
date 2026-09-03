@@ -12,7 +12,7 @@ use std::ops::Range;
 use similar::DiffOp;
 
 use super::options::DiffOptions;
-use super::similarity::dice;
+use super::similarity::{dice_sorted, sorted_bigrams};
 
 /// Sentinel for "this row has no line on this side".
 const NONE: u32 = u32::MAX;
@@ -164,7 +164,7 @@ impl DiffResult {
             .ok()
     }
 
-    /// First hunk starting at or after `row`.
+    /// First hunk starting strictly after `row`.
     pub fn hunk_after(&self, row: usize) -> Option<usize> {
         self.hunks.iter().position(|h| h.rows.start > row)
     }
@@ -238,47 +238,88 @@ pub fn diff_lines(
     opts: &DiffOptions,
     budget: Budget,
 ) -> DiffResult {
+    // Fast path: identical slices need no diff at all. The result is built
+    // directly, with exactly the shape the normal path below would produce.
+    if left == right {
+        let mut rows = Vec::with_capacity(left.len());
+        let mut unchanged = 0;
+        for (i, line) in left.iter().enumerate() {
+            let kind = if opts.is_ignorable_blank(line) {
+                RowKind::Ignored
+            } else {
+                unchanged += 1;
+                RowKind::Equal
+            };
+            rows.push(DiffRow {
+                left: i as u32,
+                right: i as u32,
+                kind,
+            });
+        }
+        return DiffResult {
+            rows,
+            hunks: Vec::new(),
+            stats: DiffStats {
+                unchanged,
+                similarity: 1.0,
+                ..DiffStats::default()
+            },
+            row_of_left: (0..left.len() as u32).collect(),
+            row_of_right: (0..left.len() as u32).collect(),
+            truncated: false,
+        };
+    }
+
     // ---- 1. Decide which lines take part in the match -------------------
     //
     // With `ignore_blank_lines` we diff only the non-blank lines and splice the
     // blanks back in afterwards, so an added empty line cannot shift a hunk.
-    let (left_idx, right_idx): (Vec<usize>, Vec<usize>) = if opts.ignore_blank_lines {
-        (
-            (0..left.len())
-                .filter(|&i| !opts.is_ignorable_blank(&left[i]))
-                .collect(),
-            (0..right.len())
-                .filter(|&i| !opts.is_ignorable_blank(&right[i]))
-                .collect(),
-        )
-    } else {
-        ((0..left.len()).collect(), (0..right.len()).collect())
-    };
+    // `None` is the identity mapping - the common case allocates nothing.
+    let (left_idx, right_idx): (Option<Vec<usize>>, Option<Vec<usize>>) =
+        if opts.ignore_blank_lines {
+            (
+                Some(
+                    (0..left.len())
+                        .filter(|&i| !opts.is_ignorable_blank(&left[i]))
+                        .collect(),
+                ),
+                Some(
+                    (0..right.len())
+                        .filter(|&i| !opts.is_ignorable_blank(&right[i]))
+                        .collect(),
+                ),
+            )
+        } else {
+            (None, None)
+        };
 
     // ---- 2. Build the comparison keys -----------------------------------
     //
     // `is_exact` is the common case; there we borrow the original strings and
     // allocate nothing per line.
     let alg = opts.algorithm.to_similar();
+    let n_left = left_idx.as_ref().map_or(left.len(), Vec::len);
+    let n_right = right_idx.as_ref().map_or(right.len(), Vec::len);
     let ops = if opts.is_exact() {
-        let a: Vec<&str> = left_idx.iter().map(|&i| left[i].as_str()).collect();
-        let b: Vec<&str> = right_idx.iter().map(|&i| right[i].as_str()).collect();
+        let a: Vec<&str> = (0..n_left)
+            .map(|i| left[left_idx.as_deref().map_or(i, |v| v[i])].as_str())
+            .collect();
+        let b: Vec<&str> = (0..n_right)
+            .map(|i| right[right_idx.as_deref().map_or(i, |v| v[i])].as_str())
+            .collect();
         similar::capture_diff_slices_deadline(alg, &a, &b, budget.deadline)
     } else {
-        let a: Vec<Cow<'_, str>> = left_idx.iter().map(|&i| opts.normalize(&left[i])).collect();
-        let b: Vec<Cow<'_, str>> = right_idx
-            .iter()
-            .map(|&i| opts.normalize(&right[i]))
+        let a: Vec<Cow<'_, str>> = (0..n_left)
+            .map(|i| opts.normalize(&left[left_idx.as_deref().map_or(i, |v| v[i])]))
+            .collect();
+        let b: Vec<Cow<'_, str>> = (0..n_right)
+            .map(|i| opts.normalize(&right[right_idx.as_deref().map_or(i, |v| v[i])]))
             .collect();
         similar::capture_diff_slices_deadline(alg, &a, &b, budget.deadline)
     };
 
-    let truncated = budget
-        .deadline
-        .is_some_and(|d| std::time::Instant::now() > d);
-
     // ---- 3. Turn ops into aligned rows ----------------------------------
-    let mut b = RowBuilder::new(left, right, &left_idx, &right_idx, opts);
+    let mut b = RowBuilder::new(left, right, left_idx.as_deref(), right_idx.as_deref(), opts);
     for op in &ops {
         match *op {
             DiffOp::Equal {
@@ -321,7 +362,11 @@ pub fn diff_lines(
     }
 
     let mut result = b.finish();
-    result.truncated = truncated;
+    // Measured only once *all* the work is done (row building and block
+    // alignment included), so a slow align also marks the result truncated.
+    result.truncated = budget
+        .deadline
+        .is_some_and(|d| std::time::Instant::now() > d);
     result
 }
 
@@ -330,14 +375,19 @@ pub fn diff_lines(
 struct RowBuilder<'a> {
     left: &'a [String],
     right: &'a [String],
-    left_idx: &'a [usize],
-    right_idx: &'a [usize],
+    /// Filtered-index → raw-line mapping; `None` is the identity (no
+    /// `ignore_blank_lines` filtering happened).
+    left_idx: Option<&'a [usize]>,
+    right_idx: Option<&'a [usize]>,
     blank_aware: bool,
 
     rows: Vec<DiffRow>,
     row_of_left: Vec<u32>,
     row_of_right: Vec<u32>,
     stats: DiffStats,
+    /// Lines emitted as `Ignored` rows, so the similarity score can exclude
+    /// them from its denominator.
+    ignored_lines: usize,
 
     /// Next raw line on each side that has not been emitted yet. Used to splice
     /// ignored blank lines back into the row list.
@@ -349,8 +399,8 @@ impl<'a> RowBuilder<'a> {
     fn new(
         left: &'a [String],
         right: &'a [String],
-        left_idx: &'a [usize],
-        right_idx: &'a [usize],
+        left_idx: Option<&'a [usize]>,
+        right_idx: Option<&'a [usize]>,
         opts: &DiffOptions,
     ) -> Self {
         let cap = left.len().max(right.len()) + 16;
@@ -364,9 +414,20 @@ impl<'a> RowBuilder<'a> {
             row_of_left: vec![NONE; left.len()],
             row_of_right: vec![NONE; right.len()],
             stats: DiffStats::default(),
+            ignored_lines: 0,
             next_raw_left: 0,
             next_raw_right: 0,
         }
+    }
+
+    /// Raw line number for a filtered index on `side`.
+    #[inline]
+    fn raw(&self, side: Side, i: usize) -> usize {
+        let idx = match side {
+            Side::Left => self.left_idx,
+            Side::Right => self.right_idx,
+        };
+        idx.map_or(i, |v| v[i])
     }
 
     /// Emit any blank lines that sit before the given raw targets.
@@ -416,7 +477,9 @@ impl<'a> RowBuilder<'a> {
             RowKind::Replace => self.stats.modified += 1,
             RowKind::Insert => self.stats.added += 1,
             RowKind::Delete => self.stats.removed += 1,
-            RowKind::Ignored => {}
+            RowKind::Ignored => {
+                self.ignored_lines += l.is_some() as usize + r.is_some() as usize;
+            }
         }
         self.rows.push(DiffRow {
             left: l.map_or(NONE, |v| v as u32),
@@ -426,19 +489,19 @@ impl<'a> RowBuilder<'a> {
     }
 
     fn push_pair(&mut self, li: usize, ri: usize, kind: RowKind) {
-        let (l, r) = (self.left_idx[li], self.right_idx[ri]);
+        let (l, r) = (self.raw(Side::Left, li), self.raw(Side::Right, ri));
         self.flush_blanks_before(Some(l), Some(r));
         self.emit(Some(l), Some(r), kind);
     }
 
     fn push_left(&mut self, li: usize, kind: RowKind) {
-        let l = self.left_idx[li];
+        let l = self.raw(Side::Left, li);
         self.flush_blanks_before(Some(l), None);
         self.emit(Some(l), None, kind);
     }
 
     fn push_right(&mut self, ri: usize, kind: RowKind) {
-        let r = self.right_idx[ri];
+        let r = self.raw(Side::Right, ri);
         self.flush_blanks_before(None, Some(r));
         self.emit(None, Some(r), kind);
     }
@@ -458,7 +521,10 @@ impl<'a> RowBuilder<'a> {
         let use_smart = opts.smart_align && n > 0 && m > 0 && cells <= budget.max_align_cells;
 
         let pairs: Vec<(usize, usize)> = if use_smart {
-            self.align_block(&old, &new, opts)
+            // `None` means the DP ran past the deadline: degrade the rest of
+            // the block to positional pairing, like the non-smart path.
+            self.align_block(&old, &new, opts, budget)
+                .unwrap_or_else(|| (0..n.min(m)).map(|k| (k, k)).collect())
         } else {
             // Positional fallback: pair index-for-index, leftovers one-sided.
             (0..n.min(m)).map(|k| (k, k)).collect()
@@ -494,23 +560,31 @@ impl<'a> RowBuilder<'a> {
     /// Same shape as an LCS DP, except the "match" reward is a continuous
     /// similarity score instead of a boolean equality, and pairs scoring below
     /// `align_threshold` are never taken.
+    ///
+    /// Returns `None` when the time budget runs out mid-DP; the caller then
+    /// falls back to positional pairing for the block.
     fn align_block(
         &self,
         old: &Range<usize>,
         new: &Range<usize>,
         opts: &DiffOptions,
-    ) -> Vec<(usize, usize)> {
+        budget: Budget,
+    ) -> Option<Vec<(usize, usize)>> {
         let (n, m) = (old.len(), new.len());
 
-        // Materialize the comparison keys once per block.
+        // Materialize the comparison keys once per block, and each line's
+        // sorted bigrams once, so the DP inner loop is just an intersection
+        // walk instead of re-tokenizing both lines per cell.
         let a: Vec<Cow<'_, str>> = old
             .clone()
-            .map(|i| opts.normalize(&self.left[self.left_idx[i]]))
+            .map(|i| opts.normalize(&self.left[self.raw(Side::Left, i)]))
             .collect();
         let b: Vec<Cow<'_, str>> = new
             .clone()
-            .map(|j| opts.normalize(&self.right[self.right_idx[j]]))
+            .map(|j| opts.normalize(&self.right[self.raw(Side::Right, j)]))
             .collect();
+        let a_bigrams: Vec<Vec<u64>> = a.iter().map(|s| sorted_bigrams(s)).collect();
+        let b_bigrams: Vec<Vec<u64>> = b.iter().map(|s| sorted_bigrams(s)).collect();
 
         // `prev`/`cur` are rolling DP rows; `choice` records the backtrack.
         // 0 = skip old, 1 = skip new, 2 = pair them.
@@ -519,6 +593,15 @@ impl<'a> RowBuilder<'a> {
         let mut choice = vec![0u8; (n + 1) * (m + 1)];
 
         for i in 1..=n {
+            // Coarse deadline check: even a per-block cell cap can exceed the
+            // comparison budget, and typing must not wait for this DP.
+            if i % 64 == 0
+                && budget
+                    .deadline
+                    .is_some_and(|d| std::time::Instant::now() > d)
+            {
+                return None;
+            }
             for j in 1..=m {
                 let skip_old = prev[j];
                 let skip_new = cur[j - 1];
@@ -528,7 +611,11 @@ impl<'a> RowBuilder<'a> {
                     (skip_new, 1u8)
                 };
 
-                let s = dice(&a[i - 1], &b[j - 1]);
+                let s = if a[i - 1] == b[j - 1] {
+                    1.0
+                } else {
+                    dice_sorted(&a_bigrams[i - 1], &b_bigrams[j - 1])
+                };
                 if s >= opts.align_threshold {
                     let paired = prev[j - 1] + s;
                     if paired > best {
@@ -557,7 +644,7 @@ impl<'a> RowBuilder<'a> {
             }
         }
         pairs.reverse();
-        pairs
+        Some(pairs)
     }
 
     fn finish(mut self) -> DiffResult {
@@ -565,8 +652,10 @@ impl<'a> RowBuilder<'a> {
         self.flush_blanks_before(Some(self.left.len()), Some(self.right.len()));
 
         // Line-level similarity: equal lines count double against the combined
-        // length, matching the usual Sorensen-Dice definition.
-        let total = self.left.len() + self.right.len();
+        // length, matching the usual Sorensen-Dice definition. `Ignored` blank
+        // lines count on neither side, so "only blank lines differ" reads as
+        // similarity 1.0, in step with `is_identical`.
+        let total = self.left.len() + self.right.len() - self.ignored_lines;
         self.stats.similarity = if total == 0 {
             1.0
         } else {
@@ -775,6 +864,10 @@ mod tests {
         };
         let d = run("a\n\n\nb", "a\nb", &opts);
         assert!(d.stats.is_identical(), "{:?}", d.stats);
+        assert_eq!(
+            d.stats.similarity, 1.0,
+            "ignored blank lines count on neither side of the similarity"
+        );
         // The blank lines still occupy rows so the editor can render them.
         assert_eq!(d.rows.iter().filter(|r| r.left().is_some()).count(), 4);
         assert_eq!(d.rows.iter().filter(|r| r.right().is_some()).count(), 2);
@@ -852,7 +945,9 @@ mod tests {
         let d = run("a\nb\nc\nd\ne", "a\nB\nc\nD\ne", &DiffOptions::default());
         assert_eq!(d.hunks.len(), 2);
         let first = d.hunk_after(0).unwrap();
-        assert_eq!(first, 1.min(first));
+        // The first change is at line 1, so the hunk starting strictly after
+        // row 0 is hunk 0 itself.
+        assert_eq!(first, 0);
         assert_eq!(d.hunk_before(d.rows.len()), Some(d.hunks.len() - 1));
         assert_eq!(d.hunk_before(0), None);
     }

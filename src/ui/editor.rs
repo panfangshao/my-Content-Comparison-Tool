@@ -37,6 +37,37 @@ const GUTTER_PAD: f32 = 10.0;
 const GUTTER_INSET: f32 = 8.0;
 /// Width of the change bar between the numbers and the text.
 const CHANGE_BAR: f32 = 3.0;
+/// How long the caret stays solid after input before the blink resumes.
+const CARET_HOLD: f64 = 0.5;
+
+/// Characters of one line that are actually laid out.
+///
+/// Text layout is linear in the length of the line, and a SQL dump puts the
+/// whole of a table in a single `INSERT`. Measured on a real 132 MB dump: the
+/// longest line is 1 045 539 characters, 52 lines are over a million, and one
+/// 749 000-character line takes **323 ms** to lay out at a 600 pt wrap width -
+/// where it becomes 11 269 visual lines. Two panes, and the frame a line like
+/// that scrolls into view costs two thirds of a second. Scrolling through a
+/// run of them is what made the window stop responding.
+///
+/// So a line is laid out up to this many characters and the rest is replaced
+/// by a marker. The document is untouched: the diff, the similarity, search,
+/// merge and saving all read the buffer, not the galley. Only what is drawn is
+/// capped. VS Code caps rendering at 10 000 characters for the same reason.
+///
+/// Beyond this width a line is unreadable anyway - at 14 pt it is already 145
+/// wrapped rows.
+pub const MAX_RENDERED_CHARS: usize = 10_000;
+
+/// Appended to a line that was too long to lay out in full.
+const TRUNCATION_MARK: &str = " …";
+
+/// No cap: the line is laid out however long it is.
+///
+/// Only ever used for a line the reader has explicitly opened, because that is
+/// the one case where several hundred milliseconds is a fair price - it was
+/// asked for, and it is paid once, for one row.
+const NO_CAP: usize = usize::MAX;
 
 #[derive(Clone, Debug)]
 pub struct EditorStyle {
@@ -48,8 +79,6 @@ pub struct EditorStyle {
     pub tab_width: usize,
     /// Where Up and Down land horizontally.
     pub vertical_motion: VerticalMotion,
-    /// Width of the digits column, derived from the largest line number.
-    pub gutter_width: f32,
 }
 
 impl EditorStyle {
@@ -111,16 +140,32 @@ pub struct PaneParams<'a> {
     pub inline: &'a mut InlineCache,
     pub palette: &'a Palette,
     pub style: &'a EditorStyle,
+    /// Only for the one label this widget can draw: the note that a row's
+    /// change fell past the rendered part of an over-long line.
+    pub lang: crate::i18n::Lang,
+    /// Line count the digits column is sized for.
+    ///
+    /// The larger of the two documents, supplied by the caller rather than
+    /// taken from this pane's own buffer. A pane that sized its own column
+    /// from its own line count gave 999 lines a three-digit column and 1000
+    /// lines a four-digit one - and since the text gets whatever width is
+    /// left over, the two panes then wrapped at widths one character apart,
+    /// which is enough to fold a long line differently on each side. One
+    /// number for both panes removes that at the source; it also stops the
+    /// two columns of text starting at visibly different offsets.
+    pub gutter_lines: usize,
     /// Syntax colours for `visible_rows`, or empty for none.
     pub highlights: &'a [Vec<StyledRange>],
     /// The rows `highlights` describes.
     pub highlight_rows: std::ops::Range<usize>,
     pub search: &'a [Match],
     pub active_match: Option<usize>,
-    /// Longest line in characters, used to size the horizontal extent.
-    /// Supplied by the caller because measuring it is O(document) and must not
-    /// happen every frame.
-    pub longest_line: usize,
+    /// Width in points of the widest line, for the horizontal extent.
+    ///
+    /// Supplied by the caller because finding which line is widest is
+    /// O(document) and must not happen every frame. Zero when wrapping, where
+    /// there is no horizontal extent to size.
+    pub longest_line: f32,
     /// Set to override the scroll position (scroll sync, jump-to-diff).
     pub force_offset: Option<Vec2>,
     pub focus_requested: bool,
@@ -132,6 +177,14 @@ pub struct PaneParams<'a> {
     /// same reason as `goal_column`: composing `nihao` into `你好` spans many
     /// frames. See [`crate::ui::ime`].
     pub composing: &'a mut Composition,
+    /// Lines the reader has opened in full, by line index on this side.
+    ///
+    /// Over-long lines are cut at [`MAX_RENDERED_CHARS`] so that scrolling
+    /// past a megabyte-long `INSERT` does not cost a third of a second a
+    /// frame. That keeps the tool usable and makes the rest of such a line
+    /// unreadable, which for a comparison tool is its own kind of broken - so
+    /// any one line can be opened in full on demand, and only that line pays.
+    pub expanded: &'a std::collections::HashSet<usize>,
 }
 
 pub struct PaneOutput {
@@ -146,6 +199,8 @@ pub struct PaneOutput {
     pub has_focus: bool,
     /// Goal column to hand back next frame.
     pub goal_column: Option<usize>,
+    /// A line whose "show whole line" control was clicked this frame.
+    pub toggle_expand: Option<usize>,
 }
 
 /// Draw one pane and process its input.
@@ -161,6 +216,8 @@ pub fn show_pane(ui: &mut Ui, p: PaneParams<'_>) -> PaneOutput {
         inline,
         palette,
         style,
+        lang,
+        gutter_lines,
         highlights,
         highlight_rows,
         search,
@@ -170,18 +227,19 @@ pub fn show_pane(ui: &mut Ui, p: PaneParams<'_>) -> PaneOutput {
         focus_requested,
         goal_column,
         composing,
+        expanded,
     } = p;
 
     inline.sync(diff_generation);
     layout.reconfigure(diff.rows.len(), style.word_wrap);
 
-    let gutter_w = style.gutter_for(buffer.len_lines());
+    let gutter_w = style.gutter_for(gutter_lines);
     let line_h = style.line_height;
     let total_h = layout.total_height(line_h);
 
-    // Horizontal extent, estimated from the longest line's character count -
-    // the scrollbar is allowed to be approximate, the text is not.
-    let est_text_w = (longest_line as f32 + 2.0) * style.font.size * 0.62;
+    // Horizontal extent: the longest line's width, plus two characters of
+    // slack so the caret has somewhere to sit past the last glyph.
+    let est_text_w = longest_line + 2.0 * ascii_advance(ui.painter(), style);
 
     // The screen column this pane owns.
     //
@@ -206,9 +264,12 @@ pub fn show_pane(ui: &mut Ui, p: PaneParams<'_>) -> PaneOutput {
     }
 
     let mut edited = false;
+    let mut toggle_expand = None;
+    let mut long_rows: Vec<LongRow> = Vec::new();
     let mut caret_row = None;
     let mut visible = 0..0;
     let mut goal = goal_column;
+    let mut has_focus = false;
 
     let out = area.show_viewport(ui, |ui, viewport| {
         let text_w = if style.word_wrap {
@@ -218,17 +279,28 @@ pub fn show_pane(ui: &mut Ui, p: PaneParams<'_>) -> PaneOutput {
             est_text_w.max(pane_w - gutter_w)
         };
 
+        // The width this pane wraps text at. A pane-width difference too small
+        // to see still flips where a long line folds - and since a row is as
+        // tall as its side with more visual lines, the wider pane then shows a
+        // dead band at the bottom of a row whose text is identical on both
+        // sides. Within a character of each other, both panes wrap at the
+        // narrower width so identical lines fold identically.
+        let wrap_w = if style.word_wrap {
+            layout.aligned_wrap_width(side, text_w, style.font.size * 0.62)
+        } else {
+            text_w
+        };
+
         // The interactive area covers the whole pane, not just the text.
         //
         // Sizing it to the content meant a three-line document only accepted
         // clicks in its top 60 pixels - and an empty one only in a single row
         // beside line number 1. Clicking anywhere in an editor should put the
         // caret somewhere, which `char_at_pos` handles by clamping.
-        // Each pane wraps at its own width - the split is rarely exactly half -
-        // so the layout has to know both, and invalidate only the side that
-        // actually changed.
+        // The layout records the width the galley wraps at - possibly snapped
+        // to the other pane's - and invalidates only the side that changed.
         if style.word_wrap {
-            layout.set_wrap_width(side, text_w);
+            layout.set_wrap_width(side, wrap_w);
         }
 
         let (rect, response) = ui.allocate_exact_size(
@@ -240,6 +312,7 @@ pub fn show_pane(ui: &mut Ui, p: PaneParams<'_>) -> PaneOutput {
             response.request_focus();
         }
         let focused = response.has_focus();
+        has_focus = focused;
 
         // Claim the navigation keys.
         //
@@ -285,10 +358,11 @@ pub fn show_pane(ui: &mut Ui, p: PaneParams<'_>) -> PaneOutput {
             side,
             rect,
             gutter_w,
-            text_w,
+            text_w: wrap_w,
             line_h,
             palette,
             style,
+            expanded,
         };
 
         let caret_line = buffer.line_of_char(buffer.selection().head);
@@ -296,6 +370,13 @@ pub fn show_pane(ui: &mut Ui, p: PaneParams<'_>) -> PaneOutput {
         // while the caret's row is laid out, because that is the only place the
         // galley for it exists.
         let mut ime_anchor: Option<Rect> = None;
+
+        // Cross-frame caret state, keyed per pane: where the caret was last
+        // seen (the IME anchor fallback) and until when the blink stays solid
+        // after input.
+        let caret_track_id = egui::Id::new(("duibi_caret_rect", matches!(side, Side::Left)));
+        let caret_hold_id = egui::Id::new(("duibi_caret_hold", matches!(side, Side::Left)));
+        let caret_hold_until: Option<f64> = ui.ctx().data(|d| d.get_temp(caret_hold_id));
 
         // ---- Rows -------------------------------------------------------
         for row_idx in rows.clone() {
@@ -349,6 +430,7 @@ pub fn show_pane(ui: &mut Ui, p: PaneParams<'_>) -> PaneOutput {
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
 
+            let cap = ctx.cap_for(line_idx);
             let galley = build_galley(
                 &text_painter,
                 line,
@@ -356,7 +438,8 @@ pub fn show_pane(ui: &mut Ui, p: PaneParams<'_>) -> PaneOutput {
                 spans,
                 palette.text,
                 style,
-                if style.word_wrap { text_w } else { f32::INFINITY },
+                if style.word_wrap { wrap_w } else { f32::INFINITY },
+                cap,
             );
 
             // Feed this side's true height back for the *next* frame.
@@ -390,11 +473,22 @@ pub fn show_pane(ui: &mut Ui, p: PaneParams<'_>) -> PaneOutput {
                 paint_whitespace(&text_painter, &ctx, &galley, origin, line);
             }
 
+            // Over-long rows get a control in the line-number column, which
+            // is drawn after every row so it sits on top. Registered here
+            // because this is where the line has already been measured.
+            let cut = truncate_for_display(&display, cap).1;
+            if cut || expanded.contains(&line_idx) {
+                long_rows.push(LongRow { line_idx, y, h, cut });
+            }
+
             // ---- Caret and any composition sitting on it ----------------
             if focused && line_idx == caret_line {
                 caret_row = Some(row_idx);
                 let caret = caret_rect(&ctx, &galley, origin, line, buffer);
-                if caret_is_showing(ui) {
+                // Remember where the caret was last seen, for the IME anchor
+                // fallback on frames where its row is off screen.
+                ui.ctx().data_mut(|d| d.insert_temp(caret_track_id, caret));
+                if caret_is_showing(ui, caret_hold_until) {
                     text_painter.rect_filled(caret, 0, palette.caret);
                 }
                 ime_anchor = Some(paint_composition(&text_painter, &ctx, composing, caret));
@@ -406,6 +500,15 @@ pub fn show_pane(ui: &mut Ui, p: PaneParams<'_>) -> PaneOutput {
         // (Painted last so it wins over any text scrolled beneath it, using a
         // layer-free trick: an opaque strip plus a re-draw of the numbers.)
         paint_gutter_backdrop(&painter, &ctx, clip, layout, diff, &rows, focused, caret_line);
+
+        // On top of the column, so it is visible however far the text is
+        // scrolled sideways - which is exactly when an over-long line needs
+        // saying so.
+        for row in &long_rows {
+            if expand_control(ui, &painter, &ctx, clip, row, lang) {
+                toggle_expand = Some(row.line_idx);
+            }
+        }
 
         // ---- Input ------------------------------------------------------
         let caret_before = buffer.selection().head;
@@ -422,6 +525,21 @@ pub fn show_pane(ui: &mut Ui, p: PaneParams<'_>) -> PaneOutput {
         }
         handle_mouse(ui, &response, buffer, diff, layout, &ctx, &mut goal);
 
+        // A caret move from the keyboard relocates the composition's anchor
+        // just as a click does, so abandon the composition too. A commit that
+        // just landed also moves the caret, but it cleared the composition
+        // first, so `cancel` reports nothing to interrupt.
+        if buffer.selection().head != caret_before {
+            interrupt |= composing.cancel();
+        }
+
+        // Fresh input keeps the caret solid for a moment: blinking straight
+        // off under the user's keystroke reads as the caret getting lost.
+        if edited || buffer.selection().head != caret_before {
+            let until = ui.input(|i| i.time) + CARET_HOLD;
+            ui.ctx().data_mut(|d| d.insert_temp(caret_hold_id, until));
+        }
+
         // ---- Tell the input method where to draw ------------------------
         //
         // This is also what *enables* it: the integration calls
@@ -429,7 +547,17 @@ pub fn show_pane(ui: &mut Ui, p: PaneParams<'_>) -> PaneOutput {
         // reports an area cannot be typed into with an input method at all.
         if focused {
             let anchor = ime_anchor.unwrap_or_else(|| {
-                Rect::from_min_size(clip.min, Vec2::new(2.0, line_h))
+                // The caret's row is off screen this frame: anchor to where
+                // the caret was last seen, clamped into the viewport, rather
+                // than jumping the candidate window to the pane's corner.
+                let last: Option<Rect> = ui.ctx().data(|d| d.get_temp(caret_track_id));
+                let x = last
+                    .map_or(clip.left(), |r| r.left())
+                    .clamp(clip.left(), clip.right());
+                let y = last
+                    .map_or(clip.top(), |r| r.top())
+                    .clamp(clip.top(), (clip.bottom() - line_h).max(clip.top()));
+                Rect::from_min_size(pos2(x, y), Vec2::new(2.0, line_h))
             });
             ui.ctx().output_mut(|o| {
                 o.ime = Some(egui::output::IMEOutput {
@@ -454,11 +582,11 @@ pub fn show_pane(ui: &mut Ui, p: PaneParams<'_>) -> PaneOutput {
                 let text = buffer.line(line);
                 let col = tabs::to_display(text, style.tab_width, col);
                 let wrap = if style.word_wrap {
-                    text_w
+                    wrap_w
                 } else {
                     f32::INFINITY
                 };
-                let measured = measure_line(&text_painter, text, style, wrap, palette.text);
+                let measured = measure_line(&text_painter, text, style, wrap, palette.text, ctx.cap_for(line));
                 let at = measured.pos_from_cursor(CCursor::new(col));
 
                 let y = rect.top() + layout.row_top(row, line_h);
@@ -482,8 +610,9 @@ pub fn show_pane(ui: &mut Ui, p: PaneParams<'_>) -> PaneOutput {
         visible_rows: visible,
         edited,
         caret_row,
-        has_focus: false,
+        has_focus,
         goal_column: goal,
+        toggle_expand,
     }
 }
 
@@ -497,6 +626,162 @@ struct RowCtx<'a> {
     line_h: f32,
     palette: &'a Palette,
     style: &'a EditorStyle,
+    /// Lines the reader has opened in full, by line index on this side.
+    expanded: &'a std::collections::HashSet<usize>,
+}
+
+impl RowCtx<'_> {
+    /// How much of `line_idx` may be laid out.
+    fn cap_for(&self, line_idx: usize) -> usize {
+        if self.expanded.contains(&line_idx) {
+            NO_CAP
+        } else {
+            MAX_RENDERED_CHARS
+        }
+    }
+}
+
+/// A row whose line is too long to draw in full, and where it sits.
+struct LongRow {
+    line_idx: usize,
+    /// Top of the row, which may be far above the viewport: an over-long line
+    /// wraps into hundreds of visual rows.
+    y: f32,
+    h: f32,
+    /// Currently cut. `false` means it is open and can be closed again.
+    cut: bool,
+}
+
+/// The control in the line-number column that opens or closes an over-long
+/// line. Returns whether it was clicked this frame.
+///
+/// # Why it lives in the gutter
+///
+/// It started at the end of the line, which is where the text stops being
+/// drawn - and that is hundreds of wrapped rows away, so the reader had to go
+/// looking for it before they could even learn the line was cut. The column is
+/// sticky: it stays put however far the text is scrolled sideways, so a marker
+/// here is both the first thing seen on such a row and always in reach.
+///
+/// The marker follows the viewport down a tall row rather than sitting at its
+/// top, because the top of a row that is 145 visual lines high is usually off
+/// screen.
+fn expand_control(
+    ui: &Ui,
+    painter: &Painter,
+    ctx: &RowCtx<'_>,
+    clip: Rect,
+    row: &LongRow,
+    lang: crate::i18n::Lang,
+) -> bool {
+    let gutter_right = clip.left() + ctx.gutter_w;
+    let rect = Rect::from_min_max(
+        pos2(gutter_right - GUTTER_PAD - CHANGE_BAR - 2.0, 0.0),
+        pos2(gutter_right - CHANGE_BAR, ctx.line_h),
+    );
+    // Keep it on screen for as long as any part of the row is.
+    let top = row
+        .y
+        .max(clip.top())
+        .min((row.y + row.h - ctx.line_h).max(row.y));
+    let rect = rect.translate(egui::vec2(0.0, top));
+
+    let response = ui
+        .interact(
+            rect,
+            ui.id().with(("expand", ctx.side as u8, row.line_idx)),
+            Sense::click(),
+        )
+        .on_hover_text(crate::i18n::t(
+            lang,
+            if row.cut {
+                "editor.show_whole_line"
+            } else {
+                "editor.collapse_line"
+            },
+        ));
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        painter.rect_filled(rect, 2, ctx.palette.hover_bg);
+    }
+
+    // A triangle rather than a glyph: the bundled fonts are not guaranteed to
+    // carry any particular arrow, and this is three points of geometry.
+    let c = rect.center();
+    let r = (ctx.line_h * 0.22).min(5.0);
+    let colour = ctx.palette.accent;
+    let points = if row.cut {
+        // Pointing right: there is more this way.
+        vec![
+            pos2(c.x - r * 0.6, c.y - r),
+            pos2(c.x - r * 0.6, c.y + r),
+            pos2(c.x + r * 0.8, c.y),
+        ]
+    } else {
+        // Pointing down: it is open.
+        vec![
+            pos2(c.x - r, c.y - r * 0.6),
+            pos2(c.x + r, c.y - r * 0.6),
+            pos2(c.x, c.y + r * 0.8),
+        ]
+    };
+    painter.add(egui::Shape::convex_polygon(
+        points,
+        colour,
+        egui::Stroke::NONE,
+    ));
+
+    response.clicked()
+}
+
+/// Points one ASCII character advances in the editor font.
+///
+/// Measured, not assumed. The rest of this file approximates it as 0.62 em,
+/// which is fine for sizing a column of digits and useless for a line 620 000
+/// characters long: the real advance at 14 pt is 8.43 pt against an assumed
+/// 8.68, and that three percent is 156 000 points - some 18 000 characters -
+/// of empty space the view would still scroll through after the text ended.
+///
+/// One 64-character layout, which egui then serves from its galley cache.
+fn ascii_advance(painter: &Painter, style: &EditorStyle) -> f32 {
+    const SAMPLE: usize = 64;
+    let width = painter
+        .layout_no_wrap("0".repeat(SAMPLE), style.font.clone(), Color32::WHITE)
+        .size()
+        .x;
+    width / SAMPLE as f32
+}
+
+/// The exact width of one line, laid out as the pane will draw it.
+///
+/// Used to size the horizontal extent, which has to agree with the text to the
+/// point rather than approximately. Per-character arithmetic cannot manage
+/// that: egui accumulates each glyph's advance in `f32`, and over hundreds of
+/// thousands of characters the rounding wanders. Measured against a
+/// 4 096-character sample, the effective advance drifted by +0.05%, -0.10% and
+/// +0.38% at 100 000, 300 000 and 620 383 characters - and on a line that long
+/// even a tenth of a percent is tens of screens of blank past the last glyph.
+///
+/// The cost is one layout of one line, and it is the same `LayoutJob` the row
+/// painter builds, so egui serves it from the galley cache it already filled.
+pub fn line_width(painter: &Painter, style: &EditorStyle, line: &str, cap: usize) -> f32 {
+    measure_line(painter, line, style, f32::INFINITY, Color32::WHITE, cap)
+        .size()
+        .x
+}
+
+/// Cut a line down to what will be laid out.
+///
+/// Returns the text to lay out and whether anything was dropped. The cut lands
+/// on a character boundary; a line at or under the cap is returned untouched,
+/// which is every line in ordinary source.
+fn truncate_for_display(display: &str, cap: usize) -> (&str, bool) {
+    // `char_indices` stops as soon as the cap is passed, so this costs nothing
+    // on a normal line and does not walk a million characters on a huge one.
+    match display.char_indices().nth(cap) {
+        Some((byte, _)) => (&display[..byte], true),
+        None => (display, false),
+    }
 }
 
 /// Build the galley for one line, applying syntax colours.
@@ -508,7 +793,13 @@ fn build_galley(
     base: Color32,
     style: &EditorStyle,
     wrap_width: f32,
+    cap: usize,
 ) -> Arc<Galley> {
+    // Cap the work before anything else, so every caller - the row painter,
+    // the caret and the hit test - sees exactly the same galley. Doing this in
+    // one place is what keeps the caret sitting where the click landed.
+    let (display, truncated) = truncate_for_display(display, cap);
+
     let mut job = LayoutJob::default();
     job.wrap.max_width = wrap_width;
     job.break_on_newline = false;
@@ -532,6 +823,9 @@ fn build_galley(
         // second mapping for a rare case, indented-with-tabs lines fall back to
         // a single colour.
         job.append(display, 0.0, fmt(base, false, false));
+        if truncated {
+            job.append(TRUNCATION_MARK, 0.0, fmt(base, false, false));
+        }
         return painter.layout_job(job);
     }
 
@@ -549,6 +843,9 @@ fn build_galley(
     }
     if at < display.len() {
         job.append(&display[at..], 0.0, fmt(base, false, false));
+    }
+    if truncated {
+        job.append(TRUNCATION_MARK, 0.0, fmt(base, false, false));
     }
     if job.text.is_empty() {
         job.append("", 0.0, fmt(base, false, false));
@@ -783,10 +1080,16 @@ fn caret_rect(
 }
 
 /// Whether the caret is visible this instant, keeping the blink clock running.
-fn caret_is_showing(ui: &Ui) -> bool {
+///
+/// `hold_until` ends the solid phase that follows input: a caret that blinks
+/// off the moment a key lands reads as a lost caret.
+fn caret_is_showing(ui: &Ui, hold_until: Option<f64>) -> bool {
     let t = ui.input(|i| i.time);
     ui.ctx()
         .request_repaint_after(std::time::Duration::from_millis(120));
+    if hold_until.is_some_and(|until| t < until) {
+        return true;
+    }
     (t * 1.9).fract() <= 0.5
 }
 
@@ -986,7 +1289,7 @@ fn char_at_pos(
     } else {
         f32::INFINITY
     };
-    let galley = measure_line(painter, line, style, wrap, ctx.palette.text);
+    let galley = measure_line(painter, line, style, wrap, ctx.palette.text, ctx.cap_for(line_idx));
 
     let origin = pos2(
         rect.left() + ctx.gutter_w,
@@ -1017,9 +1320,10 @@ fn measure_line(
     style: &EditorStyle,
     wrap_width: f32,
     color: Color32,
+    cap: usize,
 ) -> Arc<Galley> {
     let display = tabs::expand(line, style.tab_width);
-    build_galley(painter, line, &display, &[], color, style, wrap_width)
+    build_galley(painter, line, &display, &[], color, style, wrap_width, cap)
 }
 
 fn handle_mouse(
@@ -1140,13 +1444,21 @@ fn handle_keyboard(
                 }
             }
             Event::Paste(text) => {
-                buffer.insert(&text);
+                // The clipboard can carry CRLF or lone CR line endings; the
+                // buffer is LF-only, and writing a stray `\r` back out through
+                // a CRLF encoding would produce `\r\r\n`.
+                buffer.insert(&text.replace("\r\n", "\n").replace('\r', "\n"));
                 *goal = None;
             }
-            Event::Copy => ui.ctx().copy_text(buffer.selected_text()),
-            Event::Cut => {
-                ui.ctx().copy_text(buffer.selected_text());
+            // An empty selection must not clobber the clipboard.
+            Event::Copy => {
                 if !buffer.selection().is_empty() {
+                    ui.ctx().copy_text(buffer.selected_text());
+                }
+            }
+            Event::Cut => {
+                if !buffer.selection().is_empty() {
+                    ui.ctx().copy_text(buffer.selected_text());
                     buffer.replace_range(buffer.selection().range(), "");
                 }
             }
@@ -1177,7 +1489,7 @@ fn handle_keyboard(
 
                 if let Some(m) = motion {
                     let moved =
-                        editing::move_caret(buffer, m, shift, *goal, style.vertical_motion);
+                        editing::move_caret(buffer, m, shift, *goal, style.vertical_motion, style.tab_width);
                     // `move_caret` returns `None` for horizontal motions, which
                     // is how the remembered column gets cleared.
                     *goal = moved.goal_column;
@@ -1231,8 +1543,119 @@ mod tests {
             word_wrap: false,
             tab_width: 4,
                 vertical_motion: VerticalMotion::KeepColumn,
-            gutter_width: 60.0,
         }
+    }
+
+    /// A single line can be longer than an entire ordinary document, and text
+    /// layout is linear in its length. Measured on a real 132 MB SQL dump: one
+    /// 749 000-character line took 323 ms to lay out wrapped, and the frame it
+    /// scrolled into view cost 573 ms across the two panes.
+    ///
+    /// Asserted on the work done rather than on the clock, so the guard does
+    /// not turn into a measurement of how busy the machine is.
+    #[test]
+    fn a_giant_line_is_not_laid_out_in_full() {
+        let s = style();
+        let line = "SELECT ".to_owned() + &"abcdefgh, ".repeat(200_000);
+        assert!(line.chars().count() > 1_000_000, "fixture is not giant");
+
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui: &mut Ui| {
+            let g = measure_line(ui.painter(), &line, &s, 600.0, Color32::WHITE, MAX_RENDERED_CHARS);
+            let laid_out = g.text().chars().count();
+            assert!(
+                laid_out <= MAX_RENDERED_CHARS + TRUNCATION_MARK.chars().count(),
+                "laid out {laid_out} characters of a {} character line",
+                line.chars().count()
+            );
+            // Uncapped and wrapped, this line was over 11 000 visual lines.
+            assert!(g.rows.len() < 400, "{} visual lines", g.rows.len());
+            assert!(g.text().ends_with(TRUNCATION_MARK), "no truncation marker");
+        });
+        out.textures_delta.clear();
+    }
+
+    /// The cap must be invisible to ordinary text - no marker, nothing dropped.
+    #[test]
+    fn an_ordinary_line_is_laid_out_untouched() {
+        let s = style();
+        let line = "INSERT INTO `t` VALUES (1, 'a'), (2, 'b');";
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui: &mut Ui| {
+            let g = measure_line(ui.painter(), line, &s, f32::INFINITY, Color32::WHITE, MAX_RENDERED_CHARS);
+            assert_eq!(g.text(), line);
+        });
+        out.textures_delta.clear();
+    }
+
+    /// The cut is by characters, not bytes, so it cannot split a code point.
+    #[test]
+    fn the_cut_lands_on_a_character_boundary() {
+        let line = "对比工具".repeat(MAX_RENDERED_CHARS);
+        let (kept, truncated) = truncate_for_display(&line, MAX_RENDERED_CHARS);
+        assert!(truncated);
+        assert_eq!(kept.chars().count(), MAX_RENDERED_CHARS);
+        assert!(line.starts_with(kept));
+    }
+
+    #[test]
+    fn a_line_at_the_cap_is_left_alone() {
+        let line = "x".repeat(MAX_RENDERED_CHARS);
+        let (kept, truncated) = truncate_for_display(&line, MAX_RENDERED_CHARS);
+        assert!(!truncated, "a line exactly at the cap was cut");
+        assert_eq!(kept.len(), line.len());
+    }
+
+    /// The clock version of the same guard, with a threshold loose enough to
+    /// survive a loaded machine but far under the 323 ms an uncapped line cost.
+    #[test]
+    fn laying_out_a_giant_line_stays_far_under_a_frame_budget() {
+        use std::time::{Duration, Instant};
+
+        let s = style();
+        let line = "SELECT ".to_owned() + &"abcdefgh, ".repeat(200_000);
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui: &mut Ui| {
+            let t = Instant::now();
+            measure_line(ui.painter(), &line, &s, 600.0, Color32::WHITE, MAX_RENDERED_CHARS);
+            let took = t.elapsed();
+            eprintln!("giant line layout: {took:?}");
+            assert!(
+                took < Duration::from_millis(60),
+                "laying out one line took {took:?}"
+            );
+        });
+        out.textures_delta.clear();
+    }
+
+    /// The scrollable width must end where the text does.
+    ///
+    /// It was computed as an assumed 0.62 em per character. On the 620 383
+    /// character line this was reported against, that overshot the real width
+    /// by three percent - 156 000 points, some 18 000 characters - so the view
+    /// kept scrolling long after the last `;` had gone past. Per-character
+    /// arithmetic cannot be made exact either: egui accumulates advances in
+    /// `f32` and the rounding wanders both ways over a long line. So the line
+    /// is measured.
+    #[test]
+    fn the_measured_width_agrees_with_the_text_to_the_point() {
+        let s = style();
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui: &mut Ui| {
+            for n in [20usize, 4_000, 200_000] {
+                let line = "0".repeat(n);
+                let drawn =
+                    measure_line(ui.painter(), &line, &s, f32::INFINITY, Color32::WHITE, NO_CAP)
+                        .size()
+                        .x;
+                let measured = line_width(ui.painter(), &s, &line, NO_CAP);
+                assert_eq!(
+                    measured, drawn,
+                    "{n} chars: the extent is sized from a different width than the text draws at"
+                );
+            }
+        });
+        out.textures_delta.clear();
     }
 
     #[test]
@@ -1317,7 +1740,7 @@ mod tests {
 
         let mut error_at_column_40 = 0.0_f32;
         let mut out = ctx.run_ui(egui::RawInput::default(), |ui: &mut Ui| {
-            let galley = measure_line(ui.painter(), line, &s, f32::INFINITY, Color32::WHITE);
+            let galley = measure_line(ui.painter(), line, &s, f32::INFINITY, Color32::WHITE, MAX_RENDERED_CHARS);
             let real = galley.pos_from_cursor(CCursor::new(40)).min.x;
             let guessed = 40.0 * s.font.size * 0.62;
             error_at_column_40 = (real - guessed).abs();
@@ -1329,6 +1752,62 @@ mod tests {
             "the estimate was off by {error_at_column_40}pt at column 40, \
              less than one character - this test no longer proves anything"
         );
+    }
+
+    /// Two panes whose widths differ by half a character must still fold a
+    /// long line identically.
+    ///
+    /// This is the xmas_event.sql bug: the split had been dragged 0.2% off
+    /// centre, so the panes wrapped 4pt apart - and that flipped one fold on
+    /// a 2528-character INSERT line. The row took the taller side's height and
+    /// the wider pane showed a dead band at the bottom of the row, looking for
+    /// all the world like an extra empty line. The fixture below reproduces
+    /// that sensitivity: half a point of width moves it from 14 visual lines
+    /// to 13.
+    #[test]
+    fn nearly_equal_panes_fold_long_lines_identically() {
+        let s = style();
+        let line = format!(
+            "INSERT INTO `t` VALUES {}",
+            "(52516, 0, 4, 1, 'Sandals of Faith', 35148, 0, 0, 8, 16, -1, 86, 7, 19, 5, 22, 0, 89, 0, 21626, 1, 17371, 0, 50, 0, 300, 1);"
+                .repeat(6)
+        );
+        let narrow = 513.25;
+        let wide = 513.75;
+        let tol = s.font.size * 0.62;
+        let ctx = egui::Context::default();
+        let mut layout = RowLayout::wrapped(1);
+
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui: &mut Ui| {
+            // The widths really are sensitive: left alone, they fold the same
+            // text into different counts of visual lines...
+            let a = measure_line(ui.painter(), &line, &s, narrow, Color32::WHITE, MAX_RENDERED_CHARS);
+            let b = measure_line(ui.painter(), &line, &s, wide, Color32::WHITE, MAX_RENDERED_CHARS);
+            assert_eq!(a.rows.len(), 14, "fixture lost its sensitivity");
+            assert_eq!(b.rows.len(), 13, "fixture lost its sensitivity");
+            // ...and neither galley carries a glyph-less trailing segment -
+            // the dead band never came from an empty fold.
+            for (w, g) in [(narrow, &a), (wide, &b)] {
+                assert!(
+                    g.rows.iter().all(|r| !r.glyphs.is_empty()),
+                    "empty segment at width {w}"
+                );
+            }
+
+            // Frame 1: the left pane reports first; the right snaps to it.
+            let l = layout.aligned_wrap_width(Side::Left, narrow, tol);
+            layout.set_wrap_width(Side::Left, l);
+            let r = layout.aligned_wrap_width(Side::Right, wide, tol);
+            layout.set_wrap_width(Side::Right, r);
+            assert_eq!(r, narrow);
+
+            // Frame 2: both sides agree, so both fold the line the same way.
+            let l = layout.aligned_wrap_width(Side::Left, narrow, tol);
+            assert_eq!(l, narrow);
+            let g = measure_line(ui.painter(), &line, &s, l, Color32::WHITE, MAX_RENDERED_CHARS);
+            assert_eq!(g.rows.len(), a.rows.len());
+        });
+        out.textures_delta.clear();
     }
 
     /// Every column must hit-test back to itself when probed at the point it
@@ -1344,7 +1823,7 @@ mod tests {
                 "\tindented\twith\ttabs",
                 "对比工具 mixed 宽度 text",
             ] {
-                let galley = measure_line(ui.painter(), line, &s, f32::INFINITY, Color32::WHITE);
+                let galley = measure_line(ui.painter(), line, &s, f32::INFINITY, Color32::WHITE, MAX_RENDERED_CHARS);
                 let display_cols = tabs::expand(line, s.tab_width).chars().count();
 
                 for col in 0..display_cols {

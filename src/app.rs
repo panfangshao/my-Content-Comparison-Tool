@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use egui::{Key, Modifiers, RichText, Vec2};
 
@@ -31,6 +31,9 @@ use crate::ui::toolbar::{Action, MenuFacts, show_toolbar};
 /// that pausing feels instant.
 const DIFF_DEBOUNCE: Duration = Duration::from_millis(90);
 
+/// How often a pane may remeasure its longest line while the user is typing.
+const LONGEST_LINE_THROTTLE: Duration = Duration::from_millis(200);
+
 /// Above this many lines the debounce stretches, because the comparison itself
 /// costs more than the delay.
 const LARGE_DOC_LINES: usize = 20_000;
@@ -43,6 +46,10 @@ const TOAST_LIFETIME: Duration = Duration::from_secs(4);
 pub struct Pane {
     pub buffer: TextBuffer,
     pub path: Option<PathBuf>,
+    /// Modification time of `path` as this pane last read or wrote it, used
+    /// to spot a file changed on disk behind our back. `None` for a document
+    /// that has never touched a file, or when the stat failed.
+    disk_mtime: Option<SystemTime>,
     pub encoding: FileEncoding,
     pub highlighter: PaneHighlighter,
     /// Language chosen by hand, overriding detection.
@@ -58,11 +65,19 @@ pub struct Pane {
     /// Text an input method is composing into this pane, held out of the
     /// document until it commits.
     composing: crate::ui::ime::Composition,
-    /// Longest line in characters, and the document version it was measured
-    /// at. Sizing the horizontal scrollbar needs this, and measuring it is
-    /// O(document) - far too expensive to redo on every frame.
-    longest_line: usize,
+    /// Lines the reader has opened in full, despite being over-long.
+    ///
+    /// Kept per pane and per line index. Opening a megabyte-long line costs a
+    /// third of a second once, so it stays open until it is closed again -
+    /// re-paying that on every scroll would defeat the point.
+    expanded: std::collections::HashSet<usize>,
+    /// Estimated display width of the longest line in ems, the document
+    /// version it was measured at, and when. Sizing the horizontal scrollbar
+    /// needs this, and measuring it is O(document) - far too expensive to
+    /// redo on every frame, or on every keystroke of a fast typist.
+    longest_line: f32,
     longest_line_version: Option<u64>,
+    longest_line_at: Option<Instant>,
 }
 
 impl Default for Pane {
@@ -70,6 +85,7 @@ impl Default for Pane {
         Self {
             buffer: TextBuffer::new(),
             path: None,
+            disk_mtime: None,
             encoding: FileEncoding::default(),
             highlighter: PaneHighlighter::new(),
             syntax_override: None,
@@ -77,25 +93,76 @@ impl Default for Pane {
             last_visible: 0..0,
             goal_column: None,
             composing: crate::ui::ime::Composition::default(),
-            longest_line: 0,
+            expanded: std::collections::HashSet::new(),
+            longest_line: 0.0,
             longest_line_version: None,
+            longest_line_at: None,
         }
     }
 }
 
 impl Pane {
-    /// Longest line in characters, remeasured only when the document changes.
-    fn longest_line(&mut self) -> usize {
+    /// Width in points of the widest line, remeasured when the document
+    /// changes - but at most once per throttle interval, so fast typing does
+    /// not pay an O(document) scan per keystroke.
+    ///
+    /// The widest line is *picked* by a cheap per-character estimate and then
+    /// *measured* exactly, because the extent has to end where the text ends
+    /// and per-character arithmetic cannot predict that to better than a few
+    /// tenths of a percent - which on a 620 000-character line is tens of
+    /// screens of blank. Picking may occasionally choose a line that is not
+    /// quite the widest, which costs a little scrolling range, never text.
+    fn longest_line(&mut self, painter: &egui::Painter, style: &EditorStyle) -> f32 {
         let version = self.buffer.version();
-        if self.longest_line_version != Some(version) {
-            self.longest_line = self
+        let throttled = self
+            .longest_line_at
+            .is_some_and(|at| at.elapsed() < LONGEST_LINE_THROTTLE);
+        if self.longest_line_version != Some(version) && !throttled {
+            let widest = self
                 .buffer
                 .lines()
                 .iter()
-                .map(|l| l.chars().count())
-                .max()
-                .unwrap_or(0);
+                // ASCII glyphs advance ~0.62em in the UI font; everything
+                // else (CJK in particular) takes the fallback font at ~1em.
+                // A plain character count underestimates a full-width line
+                // by ~40%, which left the tail of a Chinese line outside the
+                // scrollable extent.
+                .enumerate()
+                .map(|(i, l)| {
+                    // Only as far as the pane will draw this particular line.
+                    //
+                    // The extent has to agree with what is on screen in both
+                    // directions. Sizing it to the full length of a cut line
+                    // let the view scroll a hundred screens past the last
+                    // glyph into blank space; sizing an *opened* line to the
+                    // cut length stops the view short of text that is drawn.
+                    let cap = if self.expanded.contains(&i) {
+                        usize::MAX
+                    } else {
+                        crate::ui::editor::MAX_RENDERED_CHARS
+                    };
+                    l.chars()
+                        .take(cap)
+                        .map(|c| if c.is_ascii() { 0.62 } else { 1.0 })
+                        .sum::<f32>()
+                })
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .map_or(0, |(i, _)| i);
+
+            let cap = if self.expanded.contains(&widest) {
+                usize::MAX
+            } else {
+                crate::ui::editor::MAX_RENDERED_CHARS
+            };
+            self.longest_line = crate::ui::editor::line_width(
+                painter,
+                style,
+                self.buffer.line(widest),
+                cap,
+            );
             self.longest_line_version = Some(version);
+            self.longest_line_at = Some(Instant::now());
         }
         self.longest_line
     }
@@ -135,7 +202,19 @@ struct Toast {
 /// A yes/no question that must be answered before the action proceeds.
 struct Confirm {
     prompt: String,
-    action: Action,
+    action: Pending,
+}
+
+/// What a confirmation dialog runs on "OK".
+#[derive(Clone)]
+enum Pending {
+    /// A menu action, run back through the normal queue.
+    Action(Action),
+    /// Replace a pane's document without asking again.
+    OpenForced(PathBuf, Side),
+    /// Write a pane's document even though the file changed on disk.
+    SaveForced(PathBuf, Side),
+    Quit,
 }
 
 pub struct DuiBi {
@@ -164,6 +243,9 @@ pub struct DuiBi {
     last_compare: Duration,
     /// Versions the current comparison was computed from.
     compared_versions: (u64, u64),
+    /// Versions last seen at the top of a frame. The debounce clock restarts
+    /// whenever these move, so it is anchored to the *last* keystroke.
+    seen_versions: (u64, u64),
 
     layout: RowLayout,
     inline: InlineCache,
@@ -172,6 +254,9 @@ pub struct DuiBi {
     find: FindState,
     toast: Option<Toast>,
     confirm: Option<Confirm>,
+    /// Set once the user confirms quitting with unsaved changes: the close
+    /// request that confirmation triggers must not be vetoed again.
+    allow_close: bool,
     show_shortcuts: bool,
 
     /// Where the two panes are looking, and anything about to move them.
@@ -190,6 +275,10 @@ pub struct DuiBi {
     /// hover because by the time the drop event arrives the pointer position
     /// is often already gone.
     hover_drop_x: Option<f32>,
+
+    /// The window title as last sent, so an unchanged title is not resent
+    /// every frame.
+    last_title: Option<String>,
 }
 
 impl DuiBi {
@@ -217,12 +306,14 @@ impl DuiBi {
             dirty_since: Instant::now(),
             last_compare: Duration::ZERO,
             compared_versions: (u64::MAX, u64::MAX),
+            seen_versions: (u64::MAX, u64::MAX),
             layout: RowLayout::default(),
             inline: InlineCache::default(),
             syntax: SyntaxAssets::load(),
             find: FindState::default(),
             toast: None,
             confirm: None,
+            allow_close: false,
             show_shortcuts: false,
             viewport: Viewport::default(),
             viewport_height: 600.0,
@@ -230,6 +321,7 @@ impl DuiBi {
             focused_hunk: None,
             pane_boundary_x: f32::INFINITY,
             hover_drop_x: None,
+            last_title: None,
         };
         app.restyle_if_needed(&cc.egui_ctx);
         app
@@ -311,7 +403,25 @@ impl DuiBi {
             } else {
                 crate::ui::editing::VerticalMotion::KeepColumn
             },
-            gutter_width: 0.0,
+        }
+    }
+
+    /// Line count both panes size their digits column from.
+    ///
+    /// The larger of the two documents, so the columns come out the same
+    /// width. Sizing each pane from its own document put 999 lines beside
+    /// 1000 with columns one digit apart, which left the two panes wrapping
+    /// at different widths - enough to fold a long line differently on each
+    /// side and leave a dead band at the bottom of a row whose text is
+    /// identical. In single-document mode there is only one side to consider.
+    fn gutter_lines(&self) -> usize {
+        if self.config.single_pane {
+            self.left.buffer.len_lines()
+        } else {
+            self.left
+                .buffer
+                .len_lines()
+                .max(self.right.buffer.len_lines())
         }
     }
 
@@ -326,10 +436,14 @@ impl DuiBi {
     /// Re-run the comparison if the documents or the options have moved on.
     fn maybe_recompare(&mut self, ctx: &egui::Context) {
         let versions = (self.left.buffer.version(), self.right.buffer.version());
+        // Anchor the debounce to the *last* change: every keystroke restarts
+        // the wait, so continuous typing is not interrupted by a diff that
+        // was scheduled when the first keystroke landed.
+        if versions != self.seen_versions {
+            self.seen_versions = versions;
+            self.dirty_since = Instant::now();
+        }
         if versions != self.compared_versions {
-            if !self.diff_dirty {
-                self.dirty_since = Instant::now();
-            }
             self.diff_dirty = true;
         }
         if !self.diff_dirty {
@@ -370,11 +484,21 @@ impl DuiBi {
         self.compared_versions = versions;
         self.diff_dirty = false;
         self.diff_generation = self.diff_generation.wrapping_add(1);
-        self.layout = if self.config.word_wrap {
-            RowLayout::wrapped(self.diff.rows.len())
-        } else {
-            RowLayout::uniform(self.diff.rows.len())
-        };
+        // Reconfigure rather than rebuild: when the row count did not change
+        // (the common case - the user edited text, not structure) the wrapped
+        // row heights measured so far survive, and the next frame does not
+        // re-guess every height.
+        self.layout
+            .reconfigure(self.diff.rows.len(), self.config.word_wrap);
+
+        // The hunk the user was following may have shrunk away.
+        if let Some(i) = self.focused_hunk {
+            self.focused_hunk = if self.diff.hunks.is_empty() {
+                None
+            } else {
+                Some(i.min(self.diff.hunks.len() - 1))
+            };
+        }
 
         // Put that line back where it was.
         self.viewport
@@ -451,6 +575,19 @@ impl DuiBi {
     // ---- Files ---------------------------------------------------------
 
     fn open_into(&mut self, side: Side, path: &Path) {
+        // Replacing a document that has unsaved edits throws them away -
+        // ask first. The confirmed path calls `open_forced` directly.
+        if self.pane(side).buffer.is_dirty() {
+            self.confirm = Some(Confirm {
+                prompt: t(self.lang, "msg.unsaved_changes").to_owned(),
+                action: Pending::OpenForced(path.to_path_buf(), side),
+            });
+            return;
+        }
+        self.open_forced(side, path);
+    }
+
+    fn open_forced(&mut self, side: Side, path: &Path) {
         match encoding::read_file(path) {
             Ok(decoded) => {
                 let lossy = decoded.encoding.lossy;
@@ -459,8 +596,13 @@ impl DuiBi {
                     pane.buffer.load_text(&decoded.text);
                     pane.encoding = decoded.encoding;
                     pane.path = Some(path.to_path_buf());
+                    pane.disk_mtime = disk_mtime(path);
                     pane.syntax_override = None;
                     pane.highlighter.invalidate_from(0);
+                    // Drop the longest-line throttle too: within its 200ms
+                    // window the scrollbar would keep sizing itself from the
+                    // previous document's widest line.
+                    pane.longest_line_at = None;
                 }
                 self.config.push_recent(path);
                 self.invalidate_diff();
@@ -517,23 +659,49 @@ impl DuiBi {
             return;
         };
 
+        // Overwriting a file that changed on disk since this side read it
+        // would silently destroy the other edit - ask first. Only a plain
+        // save to the pane's own path is checked: Save As goes through the
+        // system dialog, which already asks before replacing a file.
+        if !ask {
+            let recorded = self.pane(side).disk_mtime;
+            if needs_external_change_confirm(recorded, disk_mtime(&path)) {
+                self.confirm = Some(Confirm {
+                    prompt: t(self.lang, "msg.file_changed_externally").to_owned(),
+                    action: Pending::SaveForced(path, side),
+                });
+                return;
+            }
+        }
+        self.save_forced(side, &path);
+    }
+
+    /// Write the pane's document to `path` unconditionally - the caller has
+    /// already dealt with any "are you sure" the situation needs.
+    fn save_forced(&mut self, side: Side, path: &Path) {
         let text = self.pane(side).buffer.text();
         let enc = self.pane(side).encoding;
-        match encoding::write_file(&path, &text, &enc) {
-            Ok(()) => {
+        match encoding::write_file(path, &text, &enc) {
+            Ok(lossy) => {
                 {
                     let pane = self.pane_mut(side);
                     pane.buffer.mark_saved();
-                    pane.path = Some(path.clone());
+                    pane.path = Some(path.to_path_buf());
+                    pane.disk_mtime = disk_mtime(path);
                 }
-                self.config.push_recent(&path);
-                let name = path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_owned();
-                let msg = tf(self.lang, "msg.saved", &[("name", &name)]);
-                self.notify(msg);
+                self.config.push_recent(path);
+                if lossy {
+                    // Some characters could not be written in this encoding.
+                    self.notify_error(t(self.lang, "msg.lossy_encoding"));
+                } else {
+                    let name = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    let msg = tf(self.lang, "msg.saved", &[("name", &name)]);
+                    self.notify(msg);
+                }
             }
             Err(e) => {
                 let msg = tf(self.lang, "msg.save_failed", &[("err", &e.to_string())]);
@@ -624,23 +792,36 @@ impl DuiBi {
             }
 
             Action::Undo(side) => {
-                self.pane_mut(side).buffer.undo();
+                let changed = self.pane_mut(side).buffer.undo();
+                self.invalidate_highlight(side, changed);
             }
             Action::Redo(side) => {
-                self.pane_mut(side).buffer.redo();
+                let changed = self.pane_mut(side).buffer.redo();
+                self.invalidate_highlight(side, changed);
             }
             Action::SelectAll(side) => self.pane_mut(side).buffer.select_all(),
             Action::Clear(side) => {
                 self.pane_mut(side).buffer.set_text("");
+                self.invalidate_highlight(side, true);
             }
 
             Action::Swap => {
                 std::mem::swap(&mut self.left.buffer, &mut self.right.buffer);
                 std::mem::swap(&mut self.left.path, &mut self.right.path);
+                std::mem::swap(&mut self.left.disk_mtime, &mut self.right.disk_mtime);
                 std::mem::swap(&mut self.left.encoding, &mut self.right.encoding);
                 std::mem::swap(&mut self.left.syntax_override, &mut self.right.syntax_override);
                 self.left.highlighter.invalidate_from(0);
                 self.right.highlighter.invalidate_from(0);
+                // The longest-line cache is keyed by version, and each side's
+                // versions are independent: after the swap each pane would
+                // otherwise keep the *other* document's measurement. The
+                // throttle timestamp goes too, or the remeasure would wait
+                // out the rest of the 200ms interval on the stale value.
+                self.left.longest_line_version = None;
+                self.right.longest_line_version = None;
+                self.left.longest_line_at = None;
+                self.right.longest_line_at = None;
                 self.invalidate_diff();
             }
 
@@ -657,10 +838,9 @@ impl DuiBi {
 
             Action::Cleanup(op, side) => {
                 let lines = cleanup::apply(op, self.pane(side).buffer.lines());
-                let pane = self.pane_mut(side);
-                let n = pane.buffer.len_lines();
-                pane.buffer.replace_lines(0..n, &lines);
-                pane.highlighter.invalidate_from(0);
+                let n = self.pane(side).buffer.len_lines();
+                self.pane_mut(side).buffer.replace_lines(0..n, &lines);
+                self.invalidate_highlight(side, true);
             }
 
             Action::MergeAll(dir) => {
@@ -668,7 +848,7 @@ impl DuiBi {
                 // confirmation, even though it is undoable.
                 self.confirm = Some(Confirm {
                     prompt: t(self.lang, "merge.confirm_all").to_owned(),
-                    action: Action::MergeAllConfirmed(dir),
+                    action: Pending::Action(Action::MergeAllConfirmed(dir)),
                 });
             }
             Action::MergeAllConfirmed(dir) => self.merge_all(dir),
@@ -689,20 +869,49 @@ impl DuiBi {
                 self.config.font_size = d.font_size;
                 self.config.line_height = d.line_height;
             }
-            Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Action::Quit => {
+                if self.left.buffer.is_dirty() || self.right.buffer.is_dirty() {
+                    self.confirm = Some(Confirm {
+                        prompt: t(self.lang, "msg.unsaved_changes").to_owned(),
+                        action: Pending::Quit,
+                    });
+                } else {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
         }
+    }
+
+    /// Re-colour from the first line an edit touched, then clear the buffer's
+    /// dirty marker - the same bookkeeping the keyboard path does in
+    /// `draw_pane`, for edits that arrive from menus or the find bar instead.
+    /// `changed` says whether the action actually edited the document.
+    fn invalidate_highlight(&mut self, side: Side, changed: bool) {
+        let from = highlight_invalidation(changed, self.pane(side).buffer.min_dirty_line());
+        let Some(from) = from else {
+            return;
+        };
+        let pane = self.pane_mut(side);
+        pane.highlighter.invalidate_from(from);
+        pane.buffer.clear_dirty();
     }
 
     fn merge_one(&mut self, index: usize, dir: Direction) {
         let Some(hunk) = self.diff.hunks.get(index).cloned() else {
             return;
         };
-        let source_lines = self.pane(dir.source()).buffer.lines().to_vec();
-        let patch = merge::hunk_patch(&hunk, &source_lines, dir);
+        // `hunk_patch` clones only the hunk's own lines out of the borrowed
+        // source; copying the whole document first would make every click
+        // O(document).
+        let patch = merge::hunk_patch(&hunk, self.pane(dir.source()).buffer.lines(), dir);
 
-        let target = self.pane_mut(dir.target());
-        target.buffer.replace_lines(patch.range.clone(), &patch.lines);
-        target.highlighter.invalidate_from(patch.range.start);
+        let target = dir.target();
+        self.pane_mut(target)
+            .buffer
+            .replace_lines(patch.range.clone(), &patch.lines);
+        // `replace_lines` set the dirty watermark at the patch start; the
+        // shared helper re-colours from there and clears it.
+        self.invalidate_highlight(target, true);
         self.invalidate_diff();
     }
 
@@ -720,10 +929,10 @@ impl DuiBi {
         let target_lines = self.pane(dir.target()).buffer.lines().to_vec();
         let merged = merge::preview(&target_lines, &patches);
 
-        let target = self.pane_mut(dir.target());
-        let len = target.buffer.len_lines();
-        target.buffer.replace_lines(0..len, &merged);
-        target.highlighter.invalidate_from(0);
+        let target = dir.target();
+        let len = self.pane(target).buffer.len_lines();
+        self.pane_mut(target).buffer.replace_lines(0..len, &merged);
+        self.invalidate_highlight(target, true);
 
         self.invalidate_diff();
         let msg = tf(self.lang, "msg.merged", &[("n", &n.to_string())]);
@@ -802,6 +1011,23 @@ impl eframe::App for DuiBi {
 
         self.restyle_if_needed(&ctx);
 
+        // The title-bar X does not pass through Action::Quit, so it would
+        // close the window without the unsaved-changes prompt. Veto it and
+        // raise the same dialog instead; confirming it sends Close for real.
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        let dirty = self.left.buffer.is_dirty() || self.right.buffer.is_dirty();
+        if veto_close(close_requested, dirty, self.allow_close) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            // `confirm` is a single slot: while any prompt is on screen,
+            // keep vetoing but do not raise a second one over it.
+            if self.confirm.is_none() {
+                self.confirm = Some(Confirm {
+                    prompt: t(self.lang, "msg.unsaved_changes").to_owned(),
+                    action: Pending::Quit,
+                });
+            }
+        }
+
         let before_options = self.config.diff;
         let before_wrap = self.config.word_wrap;
         let before_single = self.config.single_pane;
@@ -860,9 +1086,27 @@ impl eframe::App for DuiBi {
         if std::mem::take(&mut self.needs_repaint) {
             ctx.request_repaint();
         }
+
+        // Keep the in-memory window geometry current; it is written to disk
+        // on exit (`save` / `on_exit`). A maximized window's size is not
+        // recorded - un-maximizing later would restore the maximized extent.
+        ctx.input(|i| {
+            let v = i.viewport();
+            self.config.window_maximized = v.maximized.unwrap_or(false);
+            if !self.config.window_maximized
+                && let Some(rect) = v.inner_rect
+            {
+                self.config.window_size = [rect.width(), rect.height()];
+            }
+        });
+
         self.update_title(&ctx);
     }
 
+    /// With the `persistence` feature enabled, eframe calls this on a timer
+    /// (default 30 s, `auto_save_interval`) and on exit - so a crash loses at
+    /// most half a minute of settings. `Config::save` writes atomically
+    /// (tmp + rename), so a periodic write can never leave a truncated file.
     fn save(&mut self, _storage: &mut dyn eframe::Storage) {
         if let Err(e) = self.config.save() {
             eprintln!("could not save preferences: {e}");
@@ -875,7 +1119,7 @@ impl eframe::App for DuiBi {
 }
 
 impl DuiBi {
-    fn update_title(&self, ctx: &egui::Context) {
+    fn update_title(&mut self, ctx: &egui::Context) {
         let title = if self.config.single_pane {
             format!(
                 "{}  \u{2014}  {}",
@@ -890,7 +1134,13 @@ impl DuiBi {
                 self.right.title(self.lang),
             )
         };
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        // A ViewportCommand costs a round trip to the windowing system; an
+        // unchanged title is not worth it.
+        if self.last_title.as_deref() == Some(title.as_str()) {
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+        self.last_title = Some(title);
     }
 
     /// Recompute the search hits for the pane being searched.
@@ -913,7 +1163,14 @@ impl DuiBi {
             can_redo: [self.left.buffer.can_redo(), self.right.buffer.can_redo()],
             has_diffs: !self.diff.hunks.is_empty(),
             focus_side: self.focus_side,
-            recent: self.config.recent_files.clone(),
+            // The list is read only by the File menu's Recent submenu, which
+            // can only be open when a popup already is - so cloning it while
+            // every menu is closed is wasted work.
+            recent: if egui::Popup::is_any_open(ui.ctx()) {
+                self.config.recent_files.clone()
+            } else {
+                Vec::new()
+            },
             single_pane: self.config.single_pane,
         };
 
@@ -956,6 +1213,7 @@ impl DuiBi {
                 self.find = find;
                 if changed {
                     self.find.next();
+                    self.invalidate_highlight(side, true);
                     self.invalidate_diff();
                 }
             }
@@ -966,7 +1224,7 @@ impl DuiBi {
                 self.find = find;
                 if n > 0 {
                     self.invalidate_diff();
-                    self.pane_mut(side).highlighter.invalidate_from(0);
+                    self.invalidate_highlight(side, true);
                     let msg = tf(self.lang, "msg.replaced", &[("n", &n.to_string())]);
                     self.notify(msg);
                 }
@@ -1092,13 +1350,16 @@ impl DuiBi {
                     .inner;
 
                 // ---- Merge column --------------------------------------
+                // Drawn after the left pane, so it can use the offset the
+                // left pane actually scrolled to *this* frame - the viewport's
+                // observed offset is one frame stale by comparison.
                 let gutter_out = show_gutter_column(
                     ui,
                     &self.diff,
                     &self.layout,
                     &palette,
                     style.line_height,
-                    self.viewport.offset().y,
+                    left_out.offset.y,
                     self.focused_hunk,
                     !self.diff_dirty,
                 );
@@ -1232,8 +1493,17 @@ impl DuiBi {
 
         let force_offset = self.desired_offset(side, style);
         // Read before the borrows below split `self` up.
+        let gutter_lines = self.gutter_lines();
         let goal_column = self.pane(side).goal_column;
-        let longest_line = self.pane_mut(side).longest_line();
+        // The estimate only feeds the horizontal scrollbar, which word wrap
+        // removes entirely - under wrap the O(document) scan buys nothing, and
+        // on a 100MB-class document it is a second of dead time after every
+        // edit (and once per load) for a number nobody reads.
+        let longest_line = if style.word_wrap {
+            0.0
+        } else {
+            self.pane_mut(side).longest_line(ui.painter(), style)
+        };
 
         let generation = self.diff_generation;
         let diff_options = self.config.diff;
@@ -1254,15 +1524,17 @@ impl DuiBi {
         let no_matches: Vec<crate::core::text::Match> = Vec::new();
         let search = if searching { &self.find.matches } else { &no_matches };
 
-        let (buffer, composing, other_lines) = match side {
+        let (buffer, composing, expanded, other_lines) = match side {
             Side::Left => (
                 &mut self.left.buffer,
                 &mut self.left.composing,
+                &self.left.expanded,
                 self.right.buffer.lines(),
             ),
             Side::Right => (
                 &mut self.right.buffer,
                 &mut self.right.composing,
+                &self.right.expanded,
                 self.left.buffer.lines(),
             ),
         };
@@ -1280,6 +1552,8 @@ impl DuiBi {
                 inline,
                 palette,
                 style,
+                lang: self.lang,
+                gutter_lines,
                 highlights: &highlights,
                 highlight_rows,
                 search,
@@ -1289,6 +1563,7 @@ impl DuiBi {
                 focus_requested,
                 goal_column,
                 composing,
+                expanded,
             },
         );
 
@@ -1296,13 +1571,20 @@ impl DuiBi {
             self.focus_request = None;
         }
         if out.edited {
-            let from = self
-                .pane(side)
-                .buffer
-                .min_dirty_line()
-                .unwrap_or(0);
-            self.pane_mut(side).highlighter.invalidate_from(from);
-            self.pane_mut(side).buffer.clear_dirty();
+            self.invalidate_highlight(side, true);
+        }
+
+        if let Some(line) = out.toggle_expand {
+            let pane = self.pane_mut(side);
+            if !pane.expanded.remove(&line) {
+                pane.expanded.insert(line);
+            }
+            // Opening a line changes how wide it draws, and the width estimate
+            // is cached against the document version - which opening a line
+            // does not touch. Without this the view cannot scroll to the end
+            // of the text it just started drawing.
+            pane.longest_line_version = None;
+            pane.longest_line_at = None;
         }
 
         self.pane_mut(side).last_visible = out.visible_rows;
@@ -1503,7 +1785,18 @@ impl DuiBi {
             match decided {
                 Some(true) => {
                     self.confirm = None;
-                    actions.push(pending);
+                    match pending {
+                        Pending::Action(action) => actions.push(action),
+                        Pending::OpenForced(path, side) => self.open_forced(side, &path),
+                        Pending::SaveForced(path, side) => self.save_forced(side, &path),
+                        Pending::Quit => {
+                            // This Close is the confirmed quit: it arrives
+                            // as another close request, which must not be
+                            // vetoed a second time.
+                            self.allow_close = true;
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    }
                 }
                 Some(false) => self.confirm = None,
                 None => {}
@@ -1636,6 +1929,47 @@ impl DuiBi {
     }
 }
 
+/// A file's modification time, or `None` when it cannot be told (missing
+/// file, permission error).
+fn disk_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Should the frame loop veto a window close to ask about unsaved changes?
+///
+/// The title-bar X never becomes an [`Action::Quit`], so this is the only
+/// place that question gets asked. A close the user already confirmed
+/// (`allowed`) goes through - vetoing it would keep the window open forever.
+fn veto_close(close_requested: bool, dirty: bool, allowed: bool) -> bool {
+    close_requested && dirty && !allowed
+}
+
+/// Should saving pause to ask about an external change?
+///
+/// `recorded` is the file's modification time as this side last read or wrote
+/// it; `on_disk` is what the file is now. Asking only makes sense when both
+/// are known and they disagree: a side with no record (new document, or the
+/// stat failed) and a file that no longer exists are both saved without
+/// ceremony.
+fn needs_external_change_confirm(
+    recorded: Option<SystemTime>,
+    on_disk: Option<SystemTime>,
+) -> bool {
+    matches!((recorded, on_disk), (Some(was), Some(now)) if was != now)
+}
+
+/// First line an edit may have recoloured, or `None` when nothing changed
+/// and the highlight can be left alone.
+///
+/// The buffer tracks the lowest line touched since the last `clear_dirty`;
+/// when that marker has already been acknowledged the safe answer is the
+/// whole document. An undo that hit the bottom of the undo stack changes
+/// nothing, and recolouring for it would burn a parse time slice on stale
+/// colours that are not stale.
+fn highlight_invalidation(changed: bool, min_dirty_line: Option<usize>) -> Option<usize> {
+    changed.then_some(min_dirty_line.unwrap_or(0))
+}
+
 /// Cursor x relative to the window's client area, in egui points.
 ///
 /// Windows only: winit discards the coordinates that come with a file drag, so
@@ -1761,6 +2095,107 @@ fn install_fonts(ctx: &egui::Context) {
 mod tests {
     use super::*;
 
+    fn probe_style() -> EditorStyle {
+        EditorStyle {
+            font: egui::FontId::monospace(14.0),
+            line_height: 20.0,
+            show_line_numbers: true,
+            show_whitespace: false,
+            word_wrap: false,
+            tab_width: 4,
+            vertical_motion: crate::ui::editing::VerticalMotion::KeepColumn,
+        }
+    }
+
+    /// Run the measurement inside a context, since it lays text out.
+    fn widest(pane: &mut Pane) -> f32 {
+        let ctx = egui::Context::default();
+        let style = probe_style();
+        let mut width = 0.0;
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            width = pane.longest_line(ui.painter(), &style);
+        });
+        out.textures_delta.clear();
+        width
+    }
+
+    /// The horizontal extent must stop where the text does.
+    ///
+    /// A SQL dump puts a megabyte on one line, and the pane draws only the
+    /// first `MAX_RENDERED_CHARS` of it. Sizing the scrollbar to the whole
+    /// line let it scroll a hundred screens past the last glyph, into blank
+    /// space, with no way to find the end of the text again.
+    #[test]
+    fn the_width_of_a_cut_line_is_the_width_that_is_drawn() {
+        let cap = crate::ui::editor::MAX_RENDERED_CHARS;
+        let mut pane = Pane {
+            buffer: TextBuffer::from_text(&"x".repeat(cap * 100)),
+            ..Pane::default()
+        };
+        let width = widest(&mut pane);
+
+        // One ASCII glyph is a little over 8 points at 14 pt.
+        assert!(
+            width < cap as f32 * 9.0,
+            "{width} points for a line drawn {cap} characters wide"
+        );
+        assert!(width > cap as f32 * 7.0, "{width} points is too small to be right");
+    }
+
+    /// ...and grows to match when the reader opens the line.
+    ///
+    /// The two have to agree in both directions. Left at the cut width, the
+    /// view stopped short of text the pane was already painting, so the end of
+    /// an opened line could not be reached.
+    #[test]
+    fn opening_a_line_widens_the_extent_to_match() {
+        let cap = crate::ui::editor::MAX_RENDERED_CHARS;
+        let mut pane = Pane {
+            buffer: TextBuffer::from_text(&"x".repeat(cap * 100)),
+            ..Pane::default()
+        };
+        let cut = widest(&mut pane);
+
+        pane.expanded.insert(0);
+        // The width is cached against the document version, which opening a
+        // line does not change; the caller invalidates it, so do the same here.
+        pane.longest_line_version = None;
+        pane.longest_line_at = None;
+
+        let whole = widest(&mut pane);
+        assert!(
+            whole > cut * 50.0,
+            "opened line still measured {whole} against {cut} when cut"
+        );
+    }
+
+    /// The width reported is the widest line's real drawn width, not an
+    /// approximation of it.
+    #[test]
+    fn the_widest_line_is_measured_not_estimated() {
+        let long = "much much longer line right here";
+        let mut pane = Pane {
+            buffer: TextBuffer::from_text(&format!("short\n{long}")),
+            ..Pane::default()
+        };
+        let reported = widest(&mut pane);
+
+        let ctx = egui::Context::default();
+        let style = probe_style();
+        let mut drawn = 0.0;
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            drawn = crate::ui::editor::line_width(
+                ui.painter(),
+                &style,
+                long,
+                crate::ui::editor::MAX_RENDERED_CHARS,
+            );
+        });
+        out.textures_delta.clear();
+
+        assert_eq!(reported, drawn, "the extent is not the width the text draws at");
+    }
+
     #[test]
     fn every_shortcut_row_has_a_label() {
         for (keys, key) in SHORTCUTS {
@@ -1786,5 +2221,47 @@ mod tests {
         assert_eq!(pane.title(Lang::English), "notes.txt");
         pane.buffer.insert("x");
         assert!(pane.title(Lang::English).ends_with('\u{2022}'));
+    }
+
+    #[test]
+    fn the_close_button_is_vetoed_only_while_there_is_something_to_lose() {
+        // No close request: nothing to veto.
+        assert!(!veto_close(false, true, false));
+        // A clean document closes without ceremony.
+        assert!(!veto_close(true, false, false));
+        // Unsaved changes: hold the window and ask.
+        assert!(veto_close(true, true, false));
+        // The close that a confirmed quit re-triggers must go through.
+        assert!(!veto_close(true, true, true));
+    }
+
+    #[test]
+    fn saving_asks_only_when_the_disk_file_moved() {
+        let was = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+
+        // Nothing recorded: a document never saved, or a failed stat.
+        assert!(!needs_external_change_confirm(None, Some(was)));
+        assert!(!needs_external_change_confirm(None, None));
+        // The file is exactly as this side left it.
+        assert!(!needs_external_change_confirm(Some(was), Some(was)));
+        // Someone else wrote to the file after we read it.
+        assert!(needs_external_change_confirm(Some(was), Some(now)));
+        assert!(needs_external_change_confirm(Some(now), Some(was)));
+        // The file is gone; saving recreates it rather than overwriting.
+        assert!(!needs_external_change_confirm(Some(was), None));
+    }
+
+    #[test]
+    fn highlight_invalidation_follows_the_dirty_watermark() {
+        // Nothing changed - an undo at the bottom of the stack - so
+        // recolouring would be wasted work.
+        assert_eq!(highlight_invalidation(false, Some(3)), None);
+        assert_eq!(highlight_invalidation(false, None), None);
+        // Re-colour from the lowest touched line, not the whole document.
+        assert_eq!(highlight_invalidation(true, Some(3)), Some(3));
+        // The dirty marker was already acknowledged (or never set): fall back
+        // to the whole document rather than leave stale colours behind.
+        assert_eq!(highlight_invalidation(true, None), Some(0));
     }
 }

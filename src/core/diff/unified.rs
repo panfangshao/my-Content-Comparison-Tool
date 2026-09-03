@@ -4,7 +4,7 @@
 //! export is exactly what you were looking at, including the effect of the
 //! ignore-whitespace / ignore-case options.
 
-use super::engine::{DiffResult, RowKind};
+use super::engine::{DiffResult, DiffRow, RowKind};
 
 /// Number of unchanged lines kept around each change. Three is the `diff -u`
 /// default and what code review tools expect.
@@ -72,8 +72,18 @@ fn emit_window(
 
     // Hunk header ranges. A side with no lines in the window still needs a
     // position: `diff -u` uses "lines before it", with a count of zero.
-    let (l_start, l_count) = side_range(window.iter().filter_map(|r| r.left()));
-    let (r_start, r_count) = side_range(window.iter().filter_map(|r| r.right()));
+    let (l_start, l_count) = side_range(
+        window
+            .iter()
+            .filter(|r| counts_in_patch(r))
+            .filter_map(|r| r.left()),
+    );
+    let (r_start, r_count) = side_range(
+        window
+            .iter()
+            .filter(|r| counts_in_patch(r))
+            .filter_map(|r| r.right()),
+    );
 
     let l_start = l_start.unwrap_or_else(|| lines_before(diff, rows.start, true));
     let r_start = r_start.unwrap_or_else(|| lines_before(diff, rows.start, false));
@@ -106,18 +116,23 @@ fn emit_window(
 
     for row in window {
         match row.kind {
-            RowKind::Equal | RowKind::Ignored => {
+            RowKind::Equal => {
                 flush(out, &mut dels, &mut inss);
-                // An `Ignored` row can be one-sided (a blank line that only one
-                // document has); emit it from whichever side has it, so the
-                // patch still applies cleanly.
-                if let Some(l) = row.left() {
+                let l = row.left().expect("equal row has a left line");
+                out.push(' ');
+                out.push_str(&left[l]);
+                out.push('\n');
+            }
+            RowKind::Ignored => {
+                // A blank line both documents share is context. A one-sided
+                // `Ignored` row (a blank line only one document has) belongs
+                // to neither side of the patch and is dropped entirely -
+                // emitting or counting it would make the header ranges
+                // disagree with the body.
+                if let (Some(l), Some(_)) = (row.left(), row.right()) {
+                    flush(out, &mut dels, &mut inss);
                     out.push(' ');
                     out.push_str(&left[l]);
-                    out.push('\n');
-                } else if let Some(r) = row.right() {
-                    out.push(' ');
-                    out.push_str(&right[r]);
                     out.push('\n');
                 }
             }
@@ -132,6 +147,12 @@ fn emit_window(
     flush(out, &mut dels, &mut inss);
 }
 
+/// Whether a row contributes to the exported patch. One-sided `Ignored` rows
+/// are skipped both in the body and in every count, so header and body agree.
+fn counts_in_patch(row: &DiffRow) -> bool {
+    row.kind != RowKind::Ignored || (row.left().is_some() && row.right().is_some())
+}
+
 /// `(first line index, count)` for one side of a window.
 fn side_range(mut it: impl Iterator<Item = usize>) -> (Option<usize>, usize) {
     let Some(first) = it.next() else {
@@ -141,10 +162,12 @@ fn side_range(mut it: impl Iterator<Item = usize>) -> (Option<usize>, usize) {
 }
 
 /// How many lines of one side precede `row` - the anchor for an empty range.
+/// Counts in patch terms, i.e. skipping rows the body would skip.
 fn lines_before(diff: &DiffResult, row: usize, left_side: bool) -> usize {
     diff.rows[..row]
         .iter()
         .rev()
+        .filter(|r| counts_in_patch(r))
         .find_map(|r| if left_side { r.left() } else { r.right() })
         .map_or(0, |l| l + 1)
 }
@@ -239,5 +262,73 @@ mod tests {
                 "unprefixed line: {line:?}"
             );
         }
+    }
+
+    /// `@@ -l,lc +r,rc @@` → `(lc, rc)`.
+    fn header_counts(line: &str) -> (usize, usize) {
+        let count = |part: &str| {
+            part.trim_start_matches(['-', '+'])
+                .split(',')
+                .nth(1)
+                .map_or(1, |c| c.parse().unwrap())
+        };
+        let mut parts = line
+            .trim_start_matches("@@ ")
+            .trim_end_matches(" @@")
+            .split(' ');
+        let l = count(parts.next().expect("left range"));
+        let r = count(parts.next().expect("right range"));
+        (l, r)
+    }
+
+    #[test]
+    fn one_sided_ignored_blanks_keep_header_and_body_in_step() {
+        // With `ignore_blank_lines`, the blank line only the left document has
+        // must not appear in the patch at all - neither counted nor emitted.
+        let opts = DiffOptions {
+            ignore_blank_lines: true,
+            ..Default::default()
+        };
+        let (l, r) = (lines("x\n\na"), lines("y\na"));
+        let d = diff_lines(&l, &r, &opts, Budget::unlimited());
+        let out = to_unified(&d, &l, &r, &UnifiedOptions::default());
+
+        assert!(!out.is_empty(), "a change exists, so a patch is expected");
+        assert!(
+            !out.contains(" \n"),
+            "the one-sided blank line leaked into the body: {out:?}"
+        );
+
+        // For every hunk, the header counts must equal the body's
+        // ' '+'-' (left) and ' '+'+' (right) line counts.
+        let mut checked = 0;
+        let mut header: Option<(usize, usize)> = None;
+        let (mut body_l, mut body_r) = (0usize, 0usize);
+        for line in out.lines().skip(2) {
+            if line.starts_with("@@ ") {
+                if let Some(h) = header.take() {
+                    assert_eq!(h, (body_l, body_r), "header/body mismatch: {out}");
+                    checked += 1;
+                }
+                header = Some(header_counts(line));
+                body_l = 0;
+                body_r = 0;
+            } else {
+                match line.chars().next() {
+                    Some(' ') => {
+                        body_l += 1;
+                        body_r += 1;
+                    }
+                    Some('-') => body_l += 1,
+                    Some('+') => body_r += 1,
+                    _ => {}
+                }
+            }
+        }
+        if let Some(h) = header.take() {
+            assert_eq!(h, (body_l, body_r), "header/body mismatch: {out}");
+            checked += 1;
+        }
+        assert!(checked > 0, "no hunk header found: {out:?}");
     }
 }

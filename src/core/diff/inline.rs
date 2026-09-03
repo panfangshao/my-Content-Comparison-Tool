@@ -54,27 +54,46 @@ const MAX_INLINE_LEN: usize = 8 * 1024;
 /// granularity is [`Granularity::Line`], when either line is too long, or when
 /// the two lines have nothing in common.
 pub fn inline_diff(left: &str, right: &str, opts: &DiffOptions) -> InlineDiff {
-    if opts.granularity == Granularity::Line
-        || left.len() > MAX_INLINE_LEN
-        || right.len() > MAX_INLINE_LEN
-    {
+    if opts.granularity == Granularity::Line {
+        return InlineDiff::default();
+    }
+
+    // Set aside what the two lines already agree on at each end.
+    //
+    // The length cap below used to be applied to the whole line, so an
+    // extended SQL `INSERT` - a megabyte on one line - fell straight through
+    // to "tint the whole row", and changing one value near its end showed no
+    // mark at all beyond the row tint. Almost all of such a line is shared;
+    // comparing bytes from both ends is linear and cheap, and what is left in
+    // the middle is the part actually worth diffing.
+    let (pre, suf) = common_affixes(left, right);
+    let lmid = &left[pre..left.len() - suf];
+    let rmid = &right[pre..right.len() - suf];
+
+    // Whatever survives trimming really is different, and a word diff over
+    // that is quadratic-ish and unreadable past a point.
+    if lmid.len() > MAX_INLINE_LEN || rmid.len() > MAX_INLINE_LEN {
         return InlineDiff::default();
     }
 
     let alg = opts.algorithm.to_similar();
     let changes: Vec<(ChangeTag, &str)> = match opts.granularity {
-        Granularity::Char => similar::utils::diff_chars(alg, left, right),
+        Granularity::Char => similar::utils::diff_chars(alg, lmid, rmid),
         // `diff_unicode_words` splits on Unicode word boundaries, which keeps
         // CJK text from being treated as one enormous word.
-        Granularity::Word => similar::utils::diff_unicode_words(alg, left, right),
+        Granularity::Word => similar::utils::diff_unicode_words(alg, lmid, rmid),
         Granularity::Line => unreachable!("handled above"),
     };
 
     // The returned slices are contiguous and in order for each side, so byte
     // offsets fall out of a running total - no pointer arithmetic needed.
+    // They start after the shared prefix, which is where the middles begin.
     let mut out = InlineDiff::default();
-    let (mut lpos, mut rpos) = (0usize, 0usize);
-    let mut shared = 0usize;
+    let (mut lpos, mut rpos) = (pre, pre);
+    // The trimmed ends are shared by definition, and the confetti test below
+    // weighs shared against the *whole* line, so they have to be counted.
+    let mut shared =
+        significant_len(&left[..pre]) + significant_len(&left[left.len() - suf..]);
 
     for (tag, text) in changes {
         let n = text.len();
@@ -106,6 +125,39 @@ pub fn inline_diff(left: &str, right: &str, opts: &DiffOptions) -> InlineDiff {
     }
 
     out
+}
+
+/// Byte lengths of the prefix and suffix the two lines have in common.
+///
+/// Both land on character boundaries in *both* strings, and they never
+/// overlap, so `a[pre..a.len() - suf]` is always a valid slice of either.
+fn common_affixes(a: &str, b: &str) -> (usize, usize) {
+    let (ab, bb) = (a.as_bytes(), b.as_bytes());
+    let max = ab.len().min(bb.len());
+
+    let mut pre = 0;
+    while pre < max && ab[pre] == bb[pre] {
+        pre += 1;
+    }
+    // A shared byte run can stop in the middle of a character; back off to
+    // where both strings agree it is safe to cut.
+    while pre > 0 && !(a.is_char_boundary(pre) && b.is_char_boundary(pre)) {
+        pre -= 1;
+    }
+
+    // Bounded by what the prefix left, so the two slices cannot overlap even
+    // when one line is a prefix of the other.
+    let mut suf = 0;
+    while suf < max - pre && ab[ab.len() - 1 - suf] == bb[bb.len() - 1 - suf] {
+        suf += 1;
+    }
+    while suf > 0
+        && !(a.is_char_boundary(a.len() - suf) && b.is_char_boundary(b.len() - suf))
+    {
+        suf -= 1;
+    }
+
+    (pre, suf)
 }
 
 /// Byte length ignoring whitespace.
@@ -199,11 +251,61 @@ mod tests {
         }
     }
 
+    /// Lines that share nothing are still too expensive to analyse.
     #[test]
-    fn very_long_lines_are_skipped() {
+    fn lines_that_differ_all_the_way_through_are_skipped() {
         let a = "x".repeat(MAX_INLINE_LEN + 1);
-        let b = format!("{}y", "x".repeat(MAX_INLINE_LEN));
+        let b = "y".repeat(MAX_INLINE_LEN + 1);
         assert!(inline_diff(&a, &b, &opts(Granularity::Char)).is_whole_line());
+    }
+
+    /// The case a SQL dump actually produces: a megabyte on one line with one
+    /// value changed near its end.
+    ///
+    /// The cap used to be applied to the whole line, so this fell through to
+    /// "tint the whole row" and the changed part carried no mark at all. Only
+    /// the middle is over-long now, and here the middle is three characters.
+    #[test]
+    fn a_change_late_in_a_giant_line_is_still_pinpointed() {
+        let head = "INSERT INTO `t` VALUES ".to_owned() + &"(1,'aaa'),".repeat(100_000);
+        let a = format!("{head}(1,'aaa');");
+        let b = format!("{head}(1,'bbb');");
+        assert!(a.len() > 1_000_000, "fixture is not giant");
+
+        let d = inline_diff(&a, &b, &opts(Granularity::Char));
+        assert!(!d.is_whole_line(), "a giant line got no span-level marking");
+        assert!(d.left.iter().all(|s| s.end <= a.len()));
+        assert!(d.right.iter().all(|s| s.end <= b.len()));
+
+        // The mark must sit on the change, not span the line.
+        let marked: usize = d.left.iter().map(|s| s.end - s.start).sum();
+        assert!(marked <= 8, "marked {marked} bytes for a three-byte change");
+        assert!(
+            d.left.iter().all(|s| s.start > a.len() - 100),
+            "the mark is not where the change is"
+        );
+        assert_eq!(slices(&a, &d.left), vec!["aaa"]);
+        assert_eq!(slices(&b, &d.right), vec!["bbb"]);
+    }
+
+    /// Trimming must not cut a multi-byte character in half.
+    #[test]
+    fn trimming_shared_ends_is_safe_for_multibyte_text() {
+        let head = "对比工具".repeat(5_000);
+        let a = format!("{head}甲{head}");
+        let b = format!("{head}乙{head}");
+        let d = inline_diff(&a, &b, &opts(Granularity::Char));
+        assert_eq!(slices(&a, &d.left), vec!["甲"]);
+        assert_eq!(slices(&b, &d.right), vec!["乙"]);
+    }
+
+    /// One line being a prefix of the other must not make the trimmed ends
+    /// overlap.
+    #[test]
+    fn one_line_being_a_prefix_of_the_other_is_handled() {
+        let d = inline_diff("abcdef", "abc", &opts(Granularity::Char));
+        assert_eq!(slices("abcdef", &d.left), vec!["def"]);
+        assert!(d.right.is_empty());
     }
 
     #[test]

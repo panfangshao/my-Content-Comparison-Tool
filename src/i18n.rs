@@ -1,8 +1,8 @@
 //! Interface language.
 //!
 //! A `match` on the key rather than a hash map: the strings end up in `.rodata`,
-//! lookup is a compare chain the optimizer handles well, and a missing key is a
-//! visible `⟨key⟩` in the UI rather than a silent blank.
+//! lookup is a compare chain the optimizer handles well, and a missing key
+//! falls back to an empty string rather than a panic.
 
 use serde::{Deserialize, Serialize};
 
@@ -86,8 +86,8 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
     }
 }
 
-/// `(Chinese, English)` for a key. Unknown keys render as `⟨key⟩` so a typo is
-/// obvious on screen instead of showing an empty label.
+/// `(Chinese, English)` for a key. Unknown keys fall back to an empty string -
+/// `an_unknown_key_is_empty_not_a_panic` in the tests locks that in.
 fn lookup(key: &str) -> (&'static str, &'static str) {
     match key {
         // ---- Application ------------------------------------------------
@@ -271,6 +271,8 @@ fn lookup(key: &str) -> (&'static str, &'static str) {
         "status.modified" => ("修改", "Modified"),
         "status.similarity" => ("相似度", "Similarity"),
         "status.identical" => ("两侧内容完全相同", "The two sides are identical"),
+        "editor.show_whole_line" => ("显示整行", "Show whole line"),
+        "editor.collapse_line" => ("折叠", "Collapse"),
         "status.lines_total" => ("共 {n} 行", "{n} lines"),
         "status.lines_total_one" => ("共 1 行", "1 line"),
         "status.chars" => ("字符", "chars"),
@@ -290,6 +292,7 @@ fn lookup(key: &str) -> (&'static str, &'static str) {
             "Text is very large - used fast comparison mode",
         ),
         "status.encoding" => ("编码", "Encoding"),
+        "status.compare_time" => ("上一次对比的耗时", "Time spent on the last comparison"),
 
         // ---- Messages ---------------------------------------------------
         "msg.saved" => ("已保存 {name}", "Saved {name}"),
@@ -307,6 +310,10 @@ fn lookup(key: &str) -> (&'static str, &'static str) {
         "msg.unsaved_changes" => (
             "有未保存的修改，确定要放弃吗？",
             "There are unsaved changes. Discard them?",
+        ),
+        "msg.file_changed_externally" => (
+            "该文件在磁盘上已被外部修改，保存会覆盖那些改动。确定要覆盖吗？",
+            "The file changed on disk outside the app. Saving will overwrite those changes. Overwrite?",
         ),
         "msg.confirm" => ("确定", "OK"),
         "msg.cancel" => ("取消", "Cancel"),
@@ -508,8 +515,11 @@ mod tests {
         "status.diff_list",
         "status.diff_list.title",
         "status.blank_line",
+        "status.compare_time",
         "msg.copied",
         "msg.saved",
+        "msg.unsaved_changes",
+        "msg.file_changed_externally",
         "empty.hint",
     ];
 }

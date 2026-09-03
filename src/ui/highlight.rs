@@ -69,14 +69,47 @@ const CACHE_PAD: usize = 256;
 /// of a document. Time is the thing being rationed, so time is what is counted.
 const CATCHUP_SLICE: Duration = Duration::from_millis(8);
 
-/// Lines parsed between clock readings. Reading the clock per line would itself
-/// show up in the measurement.
-const CLOCK_EVERY: usize = 32;
+/// Bytes parsed between clock readings. Reading the clock per line would
+/// itself show up in the measurement, and counting *bytes* rather than lines
+/// is what keeps the reading cadence honest when lines vary from tens of
+/// characters to the [`MAX_LINE_HIGHLIGHT_BYTES`] cap.
+const CLOCK_EVERY_BYTES: usize = 8_192;
+
+/// Lines parsed between clock readings, whichever limit is reached first.
+///
+/// Bytes alone are not enough. Ordinary source is tens of bytes a line, so
+/// 8 KB is hundreds of lines - and parsing cost tracks lines far more than it
+/// tracks bytes. On a 14 000-line file that made the gap between two readings
+/// 30 ms and the worst frame 72 ms, against a slice of 8 ms. Bytes bound the
+/// giant-line case, lines bound the ordinary one; whichever trips first wins.
+const CLOCK_EVERY_LINES: usize = 32;
 
 /// Above this many lines we do not highlight at all. Past this point the file
 /// is machine-generated far more often than not, and the checkpoint list plus
 /// the catch-up cost stop being worth it.
 pub const MAX_HIGHLIGHT_LINES: usize = 200_000;
+
+/// Above this many *bytes* we do not highlight at all, whatever the line
+/// count. The line cap misses the dump shape - a 100MB+ SQL file can be
+/// 50 000 lines of extended INSERTs - and at the measured ~2µs/byte of the
+/// pure-Rust regex backend, that is minutes of parsing the checkpoint chain
+/// would chase forever, burning its time slice on every frame. Whole-file
+/// highlighting is simply not affordable past this point; the text still
+/// renders, just uncoloured.
+pub const MAX_HIGHLIGHT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Bytes past which a single line is not fed to the parser at all.
+///
+/// The time slice is only checked *between* lines - one `parse_line` call
+/// cannot be interrupted, and its cost scales with the line. An extended SQL
+/// INSERT or a minified bundle puts a megabyte on one line, and a single call
+/// on it costs orders of magnitude more than the whole slice; a dump whose
+/// lines grow toward the bottom froze one frame per checkpoint chunk, which
+/// is exactly the "gets slower the further you scroll, then stops responding"
+/// report this constant answers. An over-long line is drawn uncoloured, and
+/// the parser state carries over as though the line were not there - for the
+/// self-contained statements dumps are made of, that is the right state.
+pub const MAX_LINE_HIGHLIGHT_BYTES: usize = 20_000;
 
 /// One highlighted run within a line: a byte range and its colour.
 #[derive(Clone, Debug, PartialEq)]
@@ -170,8 +203,6 @@ pub struct PaneHighlighter {
     theme_name: String,
     /// `checkpoints[i]` is the parser state *entering* line `i * STRIDE`.
     checkpoints: Vec<Checkpoint>,
-    /// Lines covered by `checkpoints`, i.e. `checkpoints.len() * STRIDE`.
-    parsed_upto: usize,
     /// Set when the last request could not be satisfied within the budget, so
     /// the app knows to schedule another frame.
     catching_up: bool,
@@ -190,6 +221,8 @@ pub struct PaneHighlighter {
     /// it had parsed, and a slice shorter than one checkpoint could never
     /// finish one at all.
     partial: Option<Partial>,
+    /// An upward extension of the cached window, carried across frames.
+    prefix: Option<PrefixFill>,
 }
 
 /// A checkpoint under construction: the state so far, and the next line to feed
@@ -212,6 +245,35 @@ struct CachedWindow {
     state: Option<Box<Checkpoint>>,
 }
 
+/// An upward extension of the cached window, in progress.
+///
+/// Scrolling up just past the top of the cached window keeps the parsed
+/// suffix: parsing is deterministic from a checkpoint, so only the lines
+/// between the new checkpoint and the old window top need parsing - one time
+/// slice at a time, like every other fill here - instead of rebuilding the
+/// whole padded window for a handful of new lines.
+struct PrefixFill {
+    /// The window under construction; `lines.start` is a checkpoint line.
+    lines: Range<usize>,
+    /// Styles for the prefix parsed so far, one entry per line from
+    /// `lines.start`.
+    styles: Vec<Vec<StyledRange>>,
+    /// The next line to feed the parser.
+    next_line: usize,
+    /// Where the parsed suffix begins: the old window's top.
+    suffix_start: usize,
+    /// The old window's styles, appended once the prefix is done.
+    suffix: Vec<Vec<StyledRange>>,
+    /// How far the old window had been parsed; becomes the new window's
+    /// `filled_to`.
+    filled_to: usize,
+    /// The old window's parser state at `filled_to`, kept while it is
+    /// unfinished so filling carries on where it left off.
+    suffix_state: Option<Box<Checkpoint>>,
+    /// Parser state sitting at `next_line`.
+    state: Checkpoint,
+}
+
 impl Default for PaneHighlighter {
     fn default() -> Self {
         Self::new()
@@ -224,11 +286,11 @@ impl PaneHighlighter {
             syntax_name: None,
             theme_name: String::new(),
             checkpoints: Vec::new(),
-            parsed_upto: 0,
             catching_up: false,
             cache: None,
             parsed_this_frame: 0,
             partial: None,
+            prefix: None,
         }
     }
 
@@ -252,9 +314,9 @@ impl PaneHighlighter {
 
     fn reset(&mut self) {
         self.checkpoints.clear();
-        self.parsed_upto = 0;
         self.cache = None;
         self.partial = None;
+        self.prefix = None;
     }
 
     /// Discard the checkpoints covering `line` and everything after it.
@@ -265,7 +327,6 @@ impl PaneHighlighter {
         let keep = line / STRIDE;
         if keep < self.checkpoints.len() {
             self.checkpoints.truncate(keep);
-            self.parsed_upto = keep * STRIDE;
             self.partial = None;
         } else if self.partial.as_ref().is_some_and(|p| p.next_line > line) {
             // The half-built checkpoint had already read past the edit.
@@ -274,6 +335,9 @@ impl PaneHighlighter {
         // The cached window is only good up to the edit.
         if self.cache.as_ref().is_some_and(|c| c.lines.end > line) {
             self.cache = None;
+        }
+        if self.prefix.as_ref().is_some_and(|p| p.lines.end > line) {
+            self.prefix = None;
         }
     }
 
@@ -304,6 +368,32 @@ impl PaneHighlighter {
             return empty();
         };
         if lines.len() > MAX_HIGHLIGHT_LINES || range.is_empty() {
+            // Not catching up: nothing is going to start, so no repaints either.
+            self.catching_up = false;
+            return empty();
+        }
+        // The byte cap, short-circuited: a file over it stops summing as soon
+        // as the running total crosses, so this costs nothing per frame even
+        // on the files it exists for.
+        //
+        // Only the bytes that would actually reach the parser are counted.
+        // Summing the whole file measures the wrong thing: a 135 MB SQL dump
+        // measured here holds 134.6 MB inside lines over
+        // [`MAX_LINE_HIGHLIGHT_BYTES`], which are skipped anyway, leaving
+        // 0.58 MB of real work. Counting the raw size switched highlighting
+        // off for a file that could have been coloured for well under a
+        // hundredth of the budget.
+        let mut total = 0usize;
+        if lines
+            .iter()
+            .any(|l| {
+                if l.len() <= MAX_LINE_HIGHLIGHT_BYTES {
+                    total += l.len();
+                }
+                total > MAX_HIGHLIGHT_BYTES
+            })
+        {
+            self.catching_up = false;
             return empty();
         }
         let Some(syntax) = assets.by_name(&syntax_name) else {
@@ -361,8 +451,18 @@ impl PaneHighlighter {
                 parse: ParseState::new(syntax),
                 highlight: HighlightState::new(&highlighter, ScopeStack::new()),
             });
-            self.parsed_upto = 0;
         }
+
+        // Carried across chunks, not reset per chunk.
+        //
+        // A chunk is STRIDE lines; on a file of short lines that is well under
+        // CLOCK_EVERY_BYTES, so a per-chunk counter never reached the
+        // threshold and the deadline below was never read at all. The slice
+        // was bypassed entirely and one frame ran until the whole catch-up
+        // finished - 672 ms on a 14 000-line file, the very freeze the slice
+        // exists to prevent.
+        let mut since_clock = 0usize;
+        let mut since_lines = 0usize;
 
         while self.checkpoints.len() <= needed {
             let chunk_start = (self.checkpoints.len() - 1) * STRIDE;
@@ -384,15 +484,17 @@ impl PaneHighlighter {
                 ),
             };
 
-            let mut since_clock = 0usize;
             while cursor < chunk_end {
+                let len = lines[cursor].len().max(1);
                 advance(&mut cp, &lines[cursor], &highlighter, &assets.syntaxes);
                 self.parsed_this_frame += 1;
                 cursor += 1;
-                since_clock += 1;
+                since_clock += len;
+                since_lines += 1;
 
-                if since_clock >= CLOCK_EVERY {
+                if since_clock >= CLOCK_EVERY_BYTES || since_lines >= CLOCK_EVERY_LINES {
                     since_clock = 0;
+                    since_lines = 0;
                     // Only stop if this chunk still has work left. Bailing out
                     // with the chunk *complete* would save a `next_line` equal
                     // to its end, which no chunk range contains - so the next
@@ -410,15 +512,80 @@ impl PaneHighlighter {
             }
 
             self.checkpoints.push(cp);
-            self.parsed_upto = self.checkpoints.len().saturating_sub(1) * STRIDE;
         }
 
         let Some(start_cp) = self.checkpoints.get(needed) else {
             self.catching_up = true;
             return empty();
         };
+        let cp_line = needed * STRIDE;
 
-        // ---- 2. Start the window at the checkpoint itself -------------------
+        // ---- 2. Reuse the parsed suffix when only the window top moved up ---
+        //
+        // Scrolling up out of the padded window used to throw it away and
+        // re-parse the whole thing from the new checkpoint - 500-odd lines to
+        // show a handful of new ones. The old window's styles are still valid,
+        // so only the prefix between the new checkpoint and the old window top
+        // is parsed, one slice at a time. A window that is still being filled
+        // keeps its parser state at `filled_to`, so filling simply continues
+        // once the prefix lands.
+        //
+        // Because a window top is checkpoint-aligned, one line of upward
+        // scroll moves the padded start down by CACHE_PAD + 1 lines, so "just
+        // past the top" means at most STRIDE + CACHE_PAD of prefix; anything
+        // larger is a jump, which rebuilds.
+        if self.prefix.as_ref().is_some_and(|p| {
+            p.lines.start != cp_line || end > p.lines.end
+        }) {
+            self.prefix = None; // the scroll moved on; start over
+        }
+        if self.prefix.is_none()
+            && self.cache.as_ref().is_some_and(|old| {
+                cp_line < old.lines.start
+                    && old.lines.start - cp_line <= STRIDE + CACHE_PAD
+                    && end <= old.lines.end
+            })
+        {
+            let old = self.cache.take().expect("checked above");
+            self.prefix = Some(PrefixFill {
+                lines: cp_line..old.lines.end,
+                styles: Vec::new(),
+                next_line: cp_line,
+                suffix_start: old.lines.start,
+                suffix: old.styles,
+                filled_to: old.filled_to,
+                suffix_state: old.state,
+                state: start_cp.clone(),
+            });
+        }
+        if self.prefix.is_some() {
+            if !self.fill_prefix(lines, &highlighter, &assets.syntaxes, deadline) {
+                self.catching_up = true;
+                return empty();
+            }
+            let pre = self.prefix.take().expect("checked above");
+            let mut styles = pre.styles;
+            styles.extend(pre.suffix);
+            self.cache = Some(CachedWindow {
+                filled_to: pre.filled_to,
+                state: pre.suffix_state,
+                styles,
+                lines: pre.lines,
+            });
+            // The old window may not have been filled up to `wanted` yet.
+            let complete =
+                self.extend_window(&wanted, lines, &highlighter, &assets.syntaxes, deadline);
+            if !complete {
+                self.catching_up = true;
+                return empty();
+            }
+            self.catching_up = false;
+            return self
+                .cached(&wanted)
+                .unwrap_or_else(|| vec![Vec::new(); wanted.len()]);
+        }
+
+        // ---- 3. Start the window at the checkpoint itself -------------------
         //
         // The lines between the checkpoint and the window used to be re-parsed
         // in one go, and that was the last unbounded stretch in this function -
@@ -427,7 +594,6 @@ impl PaneHighlighter {
         // those lines into the time-sliced fill below, and their colours end up
         // cached rather than thrown away.
         let cp = start_cp.clone();
-        let cp_line = needed * STRIDE;
         let span = cp_line..end;
         self.cache = Some(CachedWindow {
             styles: vec![Vec::new(); span.len()],
@@ -484,15 +650,19 @@ impl PaneHighlighter {
         };
 
         let mut since_clock = 0usize;
+        let mut since_lines = 0usize;
         while cache.filled_to < cache.lines.end {
             let index = cache.filled_to - cache.lines.start;
+            let len = lines[cache.filled_to].len().max(1);
             cache.styles[index] = styles_for(state, &lines[cache.filled_to], highlighter, syntaxes);
             self.parsed_this_frame += 1;
             cache.filled_to += 1;
-            since_clock += 1;
+            since_clock += len;
+            since_lines += 1;
 
-            if since_clock >= CLOCK_EVERY {
+            if since_clock >= CLOCK_EVERY_BYTES || since_lines >= CLOCK_EVERY_LINES {
                 since_clock = 0;
+                since_lines = 0;
                 if cache.filled_to < cache.lines.end && Instant::now() >= deadline {
                     break;
                 }
@@ -503,10 +673,55 @@ impl PaneHighlighter {
         }
         cache.filled_to >= wanted.end
     }
+
+    /// Spend up to one slice parsing the prefix of an upward extension.
+    ///
+    /// Returns true when the prefix is complete and the window can be
+    /// assembled from it and the old window's styles.
+    fn fill_prefix(
+        &mut self,
+        lines: &[String],
+        highlighter: &Highlighter<'_>,
+        syntaxes: &SyntaxSet,
+        deadline: Instant,
+    ) -> bool {
+        let Some(pre) = self.prefix.as_mut() else {
+            return false;
+        };
+        let mut since_clock = 0usize;
+        let mut since_lines = 0usize;
+        while pre.next_line < pre.suffix_start {
+            let len = lines[pre.next_line].len().max(1);
+            pre.styles.push(styles_for(
+                &mut pre.state,
+                &lines[pre.next_line],
+                highlighter,
+                syntaxes,
+            ));
+            self.parsed_this_frame += 1;
+            pre.next_line += 1;
+            since_clock += len;
+            since_lines += 1;
+
+            if since_clock >= CLOCK_EVERY_BYTES || since_lines >= CLOCK_EVERY_LINES {
+                since_clock = 0;
+                since_lines = 0;
+                if pre.next_line < pre.suffix_start && Instant::now() >= deadline {
+                    break;
+                }
+            }
+        }
+        pre.next_line >= pre.suffix_start
+    }
 }
 
 /// Advance the parser past a line without collecting its styles.
 fn advance(cp: &mut Checkpoint, line: &str, hl: &Highlighter<'_>, syntaxes: &SyntaxSet) {
+    // An over-long line would cost more than the whole time slice in one
+    // uninterruptible call; the state simply carries over it.
+    if line.len() > MAX_LINE_HIGHLIGHT_BYTES {
+        return;
+    }
     // A malformed syntax definition can make `parse_line` fail; treat that as
     // "no scopes on this line" rather than losing highlighting for the file.
     let Ok(ops) = cp.parse.parse_line(line, syntaxes) else {
@@ -524,6 +739,10 @@ fn styles_for(
     hl: &Highlighter<'_>,
     syntaxes: &SyntaxSet,
 ) -> Vec<StyledRange> {
+    // Same guard as `advance`: over-long lines are drawn uncoloured.
+    if line.len() > MAX_LINE_HIGHLIGHT_BYTES {
+        return Vec::new();
+    }
     let Ok(ops) = cp.parse.parse_line(line, syntaxes) else {
         return Vec::new();
     };
@@ -724,6 +943,52 @@ mod tests {
             let got = settle(&mut scrolled, &a, "base16-ocean.dark", &lines, window.clone());
             assert_eq!(got, all[window.clone()], "window {window:?} disagreed");
         }
+        // ...and back up, which crosses window tops and so exercises the
+        // suffix-reusing upward extension.
+        for top in (0..2_800).rev().step_by(37) {
+            let window = top..top + 60;
+            let got = settle(&mut scrolled, &a, "base16-ocean.dark", &lines, window.clone());
+            assert_eq!(got, all[window.clone()], "window {window:?} disagreed");
+        }
+    }
+
+    /// Scrolling up just past the top of the cached window reuses its parsed
+    /// suffix: the lines below stay parsed, so scrolling back down costs
+    /// nothing.
+    #[test]
+    fn scrolling_up_a_little_reuses_the_parsed_suffix() {
+        let a = assets();
+        let lines = rust_lines(3_000);
+
+        let mut sequential = PaneHighlighter::new();
+        sequential.set_syntax(Some("Rust"));
+        let all = settle(&mut sequential, &a, "base16-ocean.dark", &lines, 0..lines.len());
+
+        let mut h = PaneHighlighter::new();
+        h.set_syntax(Some("Rust"));
+        // A window whose padded cache starts at a checkpoint well past 0.
+        let home = 1_000..1_060;
+        settle(&mut h, &a, "base16-ocean.dark", &lines, home.clone());
+        let cache_start = h.cache.as_ref().expect("cached").lines.start;
+        assert!(cache_start > 0);
+
+        // Scroll up just past the top of the cache.
+        let up = cache_start - 10..cache_start + 50;
+        let got = settle(&mut h, &a, "base16-ocean.dark", &lines, up.clone());
+        assert_eq!(got, all[up.clone()], "reused window disagreed");
+
+        // The parsed suffix must survive: scrolling back down to the original
+        // window is served from the cache without parsing a single line.
+        let mut parsed = 0;
+        let got = loop {
+            let out = h.highlight(&a, "base16-ocean.dark", &lines, home.clone());
+            parsed += h.parsed_last_frame();
+            if !h.is_catching_up() {
+                break out;
+            }
+        };
+        assert_eq!(got, all[home.clone()]);
+        assert_eq!(parsed, 0, "the old window's parsed suffix was thrown away");
     }
 
     #[test]
@@ -839,44 +1104,54 @@ mod tests {
         let mut h = PaneHighlighter::new();
         h.set_syntax(Some("Rust"));
 
-        // Measured in lines parsed, not milliseconds.
+        // Bounded by the clock, because the clock is what the slice rations.
         //
-        // A wall-clock assertion here measures how loaded the machine is, and
-        // it did exactly that: this test passed alone and failed when run
-        // beside 300 others. Lines parsed is what the time slice is actually
-        // rationing, and it does not move with load.
+        // This was briefly asserted on lines parsed instead, on the theory that
+        // work does not move with machine load the way a stopwatch does. That
+        // was wrong twice over: lines per frame is exactly what varies with
+        // machine speed - this machine fits over 9 000 trivial lines into 8 ms -
+        // and the regression being guarded against, a budget of 4 096 *lines*,
+        // did less work per frame than a healthy run does here. Work cannot
+        // separate the two; only time can.
         //
-        // The slice targets ~64 lines a frame at the ~125 us/line this parser
-        // costs. The bound is set far above that because a faster machine
-        // legitimately fits more into 8 ms - it is here to catch a phase that
-        // ignores the budget entirely, which is what the old 4096-line budget
-        // did when it produced a 661 ms freeze.
-        const UNBOUNDED: usize = 2_000;
+        // The threshold is 30x the slice, far above any plausible scheduling
+        // hiccup and far below the 661 ms freeze the line-based budget caused.
+        const TOO_LONG: Duration = Duration::from_millis(250);
+
+        // One untimed call first. The very first highlight of a document also
+        // builds the theme's selector tables and warms the allocator - measured
+        // at 59 ms here against 10 ms for every frame after it. That is a
+        // one-off, not a stalled frame, and leaving it in made this assertion
+        // fail only when the suite ran in parallel: it was measuring start-up
+        // under load, not the time slice.
+        h.highlight(&a, "base16-ocean.dark", &lines, 9_000..9_060);
 
         let mut frames = 0;
-        let mut worst = 0;
+        let mut worst = Duration::ZERO;
+        let mut worst_at = 0;
         let mut total = Duration::ZERO;
         loop {
             let start = Instant::now();
             h.highlight(&a, "base16-ocean.dark", &lines, 9_000..9_060);
-            total += start.elapsed();
-            worst = worst.max(h.parsed_last_frame());
+            let took = start.elapsed();
+            total += took;
+            if took > worst {
+                worst = took;
+                worst_at = frames;
+            }
             frames += 1;
 
             assert!(
-                h.parsed_last_frame() <= UNBOUNDED,
-                "one frame parsed {} lines; a phase is ignoring the time slice",
-                h.parsed_last_frame()
+                took < TOO_LONG,
+                "one frame spent {took:?} parsing; a phase is ignoring the time slice"
             );
             if !h.is_catching_up() || frames > 600 {
                 break;
             }
         }
 
-        // Timing is reported, not asserted, for the reason above. The
-        // integration benchmarks in `tests/` carry the frame-time thresholds.
         eprintln!(
-            "caught up in {frames} frames, worst {worst} lines parsed,              {:?} average frame",
+            "caught up in {frames} frames, worst {worst:?} at frame {worst_at}, {:?} average",
             total / frames
         );
         assert!(frames > 1, "the work was not spread over frames at all");
@@ -889,6 +1164,59 @@ mod tests {
         let mut h = PaneHighlighter::new();
         h.set_syntax(Some("Rust"));
         let out = h.highlight(&a, "base16-ocean.dark", &lines, 0..10);
+        assert!(out.iter().all(Vec::is_empty));
+    }
+
+    /// A dump is enormous but almost none of it is parsed, so it must still
+    /// be coloured.
+    ///
+    /// The byte cap used to sum the whole file. On a real 135 MB SQL dump that
+    /// was 134.6 MB of lines over [`MAX_LINE_HIGHLIGHT_BYTES`] - lines the
+    /// parser skips anyway - leaving 0.58 MB of actual work, and highlighting
+    /// was switched off for the entire file on the strength of bytes nobody
+    /// was ever going to parse.
+    #[test]
+    fn giant_lines_do_not_count_toward_the_document_byte_cap() {
+        let a = assets();
+        let mut lines = rust_lines(40);
+        // Enough over-long lines to blow the cap several times over.
+        let giant = "x".repeat(MAX_LINE_HIGHLIGHT_BYTES + 1);
+        for _ in 0..(4 * MAX_HIGHLIGHT_BYTES / giant.len()) {
+            lines.push(giant.clone());
+        }
+        let raw: usize = lines.iter().map(String::len).sum();
+        assert!(raw > MAX_HIGHLIGHT_BYTES, "fixture is not over the cap");
+
+        let mut h = PaneHighlighter::new();
+        h.set_syntax(Some("Rust"));
+        let mut out = h.highlight(&a, "base16-ocean.dark", &lines, 0..4);
+        for _ in 0..20 {
+            if !h.is_catching_up() {
+                break;
+            }
+            out = h.highlight(&a, "base16-ocean.dark", &lines, 0..4);
+        }
+        assert!(
+            out.iter().any(|s| !s.is_empty()),
+            "a {raw}-byte document was left uncoloured although only \
+             {} bytes of it are parseable",
+            lines
+                .iter()
+                .filter(|l| l.len() <= MAX_LINE_HIGHLIGHT_BYTES)
+                .map(String::len)
+                .sum::<usize>()
+        );
+    }
+
+    /// The cap still has to fire on a document that really is all parseable.
+    #[test]
+    fn a_document_of_parseable_bytes_over_the_cap_is_skipped() {
+        let a = assets();
+        let line = "let x = 1; // ".to_owned() + &"y".repeat(1_000);
+        let lines = vec![line.clone(); MAX_HIGHLIGHT_BYTES / line.len() + 2];
+        let mut h = PaneHighlighter::new();
+        h.set_syntax(Some("Rust"));
+        let out = h.highlight(&a, "base16-ocean.dark", &lines, 0..4);
         assert!(out.iter().all(Vec::is_empty));
     }
 

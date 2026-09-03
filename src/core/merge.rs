@@ -80,12 +80,27 @@ pub fn all_patches(diff: &DiffResult, source_lines: &[String], dir: Direction) -
 }
 
 /// The lines the target document ends up with, for preview and for tests.
+///
+/// The patches arrive last-hunk-first and never overlap, so the result is
+/// assembled in a single pass from the tail backwards - each untouched gap
+/// is copied exactly once. Splicing every patch into one buffer instead
+/// would shift the tail once per patch, costing O(hunks x document) on a
+/// merge-all preview.
 pub fn preview(target_lines: &[String], patches: &[LinePatch]) -> Vec<String> {
-    let mut out = target_lines.to_vec();
+    let mut pieces: Vec<&[String]> = Vec::with_capacity(patches.len() * 2 + 1);
+    let mut tail = target_lines.len();
     for p in patches {
-        let start = p.range.start.min(out.len());
-        let end = p.range.end.clamp(start, out.len());
-        out.splice(start..end, p.lines.iter().cloned());
+        let start = p.range.start.min(tail);
+        let end = p.range.end.clamp(start, tail);
+        pieces.push(&target_lines[end..tail]);
+        pieces.push(&p.lines);
+        tail = start;
+    }
+    pieces.push(&target_lines[..tail]);
+    let len = pieces.iter().map(|s| s.len()).sum();
+    let mut out = Vec::with_capacity(len);
+    for piece in pieces.iter().rev() {
+        out.extend_from_slice(piece);
     }
     out
 }

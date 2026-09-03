@@ -90,13 +90,31 @@ impl Matcher {
     /// Replace every match, returning the new lines and how many were replaced.
     ///
     /// In regex mode `replacement` supports `$1` / `${name}` capture references.
+    /// Zero-width matches (`x*`, `^`) are skipped, matching what
+    /// [`Matcher::find_all`] counts and highlights.
     pub fn replace_all(&self, lines: &[String], replacement: &str) -> (Vec<String>, usize) {
         let mut count = 0;
         let out = lines
             .iter()
             .map(|l| {
-                count += self.re.find_iter(l).filter(|m| m.start() != m.end()).count();
-                self.re.replace_all(l, replacement).into_owned()
+                // Splice by hand: `Regex::replace_all` would also replace the
+                // zero-width matches that find_all filters out, and the count
+                // would no longer describe what actually changed.
+                let mut line = String::with_capacity(l.len());
+                let mut at = 0;
+                for m in self.re.find_iter(l) {
+                    if m.start() == m.end() {
+                        continue;
+                    }
+                    line.push_str(&l[at..m.start()]);
+                    // Re-run the regex on just the match so `$1` resolves
+                    // against it, as in `replace_one`.
+                    line.push_str(&self.re.replace(m.as_str(), replacement));
+                    at = m.end();
+                    count += 1;
+                }
+                line.push_str(&l[at..]);
+                line
             })
             .collect();
         (out, count)
@@ -232,6 +250,21 @@ mod tests {
         let (out, n) = m.replace_all(&v(&["user@host"]), "$2:$1");
         assert_eq!(out, v(&["host:user"]));
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn replace_all_skips_zero_width_matches_like_find_all() {
+        // `x*` matches everywhere; only the non-empty matches count.
+        let m = query("x*", SearchMode::Regex, true).compile().unwrap();
+        let (out, n) = m.replace_all(&v(&["axbx"]), "-");
+        assert_eq!(out, v(&["a-b-"]));
+        assert_eq!(n, 2, "the count must agree with what was replaced");
+
+        // `^` has only zero-width matches: nothing changes, nothing counts.
+        let m = query("^", SearchMode::Regex, true).compile().unwrap();
+        let (out, n) = m.replace_all(&v(&["ab", "cd"]), ">");
+        assert_eq!(out, v(&["ab", "cd"]));
+        assert_eq!(n, 0);
     }
 
     #[test]

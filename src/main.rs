@@ -48,6 +48,10 @@ fn main() -> eframe::Result {
             .with_maximized(saved.window_maximized)
             .with_app_id("duibi"),
         centered: true,
+        // Let eframe keep the window geometry in its own storage too: it is
+        // saved on a timer (and on exit), so even a crash keeps the size the
+        // user left. The config file remains the source read at startup.
+        persist_window: true,
         ..Default::default()
     };
 

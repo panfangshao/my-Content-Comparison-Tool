@@ -223,6 +223,49 @@ fn trailing_newline_differences_merge_cleanly() {
     }
 }
 
+/// The full loop the UI runs when a user merges a hunk, takes it back, and
+/// then pulls changes across the other way: merge -> undo -> compare again ->
+/// merge the other direction. The undo has to restore not just the text but
+/// the dirty flag (the save point in the history), and the re-comparison has
+/// to reproduce the first result exactly - any drift means undo left the
+/// line cache inconsistent.
+#[test]
+fn merge_undo_recompare_then_merge_the_other_way_converges() {
+    let mut left = TextBuffer::from_text(OLD);
+    let mut right = TextBuffer::from_text(NEW);
+
+    let first = compare(&left, &right);
+    assert!(first.hunks.len() >= 2, "the fixture should offer several hunks");
+    // DiffRow and Hunk carry no PartialEq; their Debug form is the snapshot.
+    let first_rows = format!("{:?}", first.rows);
+    let first_hunks = format!("{:?}", first.hunks);
+
+    // Merge the first hunk rightwards, like clicking its arrow.
+    let original_right = right.text();
+    merge_hunk(&mut left, &mut right, 0, Direction::ToRight);
+    assert!(right.is_dirty(), "a merge edits the target document");
+
+    // Take it back. The text returns to what it was, and because a freshly
+    // loaded document sits on its history's save point, the dirty flag clears
+    // too - the title bar loses its bullet.
+    assert!(right.undo());
+    assert_eq!(right.text(), original_right);
+    assert!(!right.is_dirty(), "undo back to the save point reads clean");
+
+    // Comparing again must produce exactly the first result.
+    let second = compare(&left, &right);
+    assert_eq!(format!("{:?}", second.rows), first_rows, "rows drifted");
+    assert_eq!(format!("{:?}", second.hunks), first_hunks, "hunks drifted");
+
+    // Now pull the same first hunk the other way, then finish leftwards.
+    merge_hunk(&mut left, &mut right, 0, Direction::ToLeft);
+    merge_all(&mut left, &mut right, Direction::ToLeft);
+
+    let after = compare(&left, &right);
+    assert!(after.stats.is_identical(), "{:?}", after.stats);
+    assert_eq!(left.lines(), right.lines());
+}
+
 /// The unified export must describe the same change the merge would make.
 #[test]
 fn the_exported_patch_matches_what_merging_does() {

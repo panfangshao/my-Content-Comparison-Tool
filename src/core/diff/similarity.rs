@@ -16,24 +16,33 @@ pub fn dice(a: &str, b: &str) -> f32 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
     }
+    dice_sorted(&sorted_bigrams(a), &sorted_bigrams(b))
+}
 
-    let a_bigrams = bigrams(a);
-    let b_bigrams = bigrams(b);
-    if a_bigrams.is_empty() || b_bigrams.is_empty() {
+/// Sorted character bigrams of `s`, computed once so a similarity DP can
+/// score many pairs without re-tokenizing and re-sorting the same lines.
+pub fn sorted_bigrams(s: &str) -> Vec<u64> {
+    let mut v = bigrams(s);
+    v.sort_unstable();
+    v
+}
+
+/// Sorensen-Dice coefficient over two *sorted* bigram lists, in `0.0..=1.0`.
+///
+/// Exact string equality must be handled by the caller (score 1.0): two
+/// single-character strings have no bigrams, so their equality is invisible
+/// here and would otherwise score 0.
+pub fn dice_sorted(a: &[u64], b: &[u64]) -> f32 {
+    if a.is_empty() || b.is_empty() {
         // Both are single characters: it's a match only if they're equal,
-        // which the fast path above already ruled out.
+        // which the caller's equality check already ruled out.
         return 0.0;
     }
 
-    // Multiset intersection: sort both and walk them in lockstep.
-    let mut a_sorted = a_bigrams;
-    let mut b_sorted = b_bigrams;
-    a_sorted.sort_unstable();
-    b_sorted.sort_unstable();
-
+    // Multiset intersection: both lists are sorted, so walk them in lockstep.
     let (mut i, mut j, mut hits) = (0usize, 0usize, 0usize);
-    while i < a_sorted.len() && j < b_sorted.len() {
-        match a_sorted[i].cmp(&b_sorted[j]) {
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
             std::cmp::Ordering::Less => i += 1,
             std::cmp::Ordering::Greater => j += 1,
             std::cmp::Ordering::Equal => {
@@ -44,7 +53,7 @@ pub fn dice(a: &str, b: &str) -> f32 {
         }
     }
 
-    2.0 * hits as f32 / (a_sorted.len() + b_sorted.len()) as f32
+    2.0 * hits as f32 / (a.len() + b.len()) as f32
 }
 
 /// Character bigrams packed into a `u64` so they sort and compare as integers.

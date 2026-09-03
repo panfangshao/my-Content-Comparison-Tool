@@ -27,11 +27,28 @@ use duibi::ui::rowlayout::RowLayout;
 use duibi::ui::theme::Palette;
 
 const LINES: usize = 10_000;
+const WRAPPED_LINES: usize = 100_000;
 const VIEW: Vec2 = Vec2::new(900.0, 700.0);
 
 fn document(lines: usize) -> TextBuffer {
     let text: Vec<String> = (0..lines)
         .map(|i| format!("    let value_{i} = compute(input, {i}); // step {i}"))
+        .collect();
+    TextBuffer::from_text(&text.join("\n"))
+}
+
+/// A document whose rows genuinely wrap: most lines are short, but every
+/// 32nd is long enough to fold into several visual lines at pane width, so
+/// the row heights actually vary.
+fn wrapping_document(lines: usize) -> TextBuffer {
+    let text: Vec<String> = (0..lines)
+        .map(|i| {
+            if i % 32 == 0 {
+                format!("    // step {i}: {}", "a very long comment that folds over ".repeat(10))
+            } else {
+                format!("    let value_{i} = compute(input, {i}); // step {i}")
+            }
+        })
         .collect();
     TextBuffer::from_text(&text.join("\n"))
 }
@@ -45,7 +62,7 @@ struct Harness {
     inline: InlineCache,
     style: EditorStyle,
     palette: Palette,
-    longest: usize,
+    longest: f32,
     first: bool,
     assets: std::sync::Arc<SyntaxAssets>,
     highlighters: [PaneHighlighter; 2],
@@ -66,7 +83,15 @@ impl Harness {
             Budget::unlimited(),
         );
         let layout = RowLayout::uniform(diff.rows.len());
-        let longest = left.lines().iter().map(|l| l.chars().count()).max().unwrap_or(0);
+        let longest = left
+            .lines()
+            .iter()
+            .map(|l| {
+                l.chars()
+                    .map(|c| if c.is_ascii() { 0.62 } else { 1.0 })
+                    .sum::<f32>()
+            })
+            .fold(0.0, f32::max);
 
         Self {
             ctx: egui::Context::default(),
@@ -83,7 +108,6 @@ impl Harness {
                 word_wrap: false,
                 tab_width: 4,
                 vertical_motion: VerticalMotion::KeepColumn,
-                gutter_width: 0.0,
             },
             palette: Palette::dark(),
             longest,
@@ -99,6 +123,27 @@ impl Harness {
         }
     }
 
+    /// The same harness with word wrap on, over a much larger document:
+    /// rows have variable heights, so geometry goes through the Fenwick tree.
+    fn new_wrapped(lines: usize) -> Self {
+        let mut h = Self::new();
+        h.left = wrapping_document(lines);
+        h.right = wrapping_document(lines);
+        h.right.replace_lines(
+            lines / 2..lines / 2 + 1,
+            &["    let value_mid = changed();".into()],
+        );
+        h.diff = diff_lines(
+            h.left.lines(),
+            h.right.lines(),
+            &DiffOptions::default(),
+            Budget::unlimited(),
+        );
+        h.layout = RowLayout::wrapped(h.diff.rows.len());
+        h.style.word_wrap = true;
+        h
+    }
+
     /// Draw both panes once, exactly as a real frame does.
     fn frame(&mut self, scroll_y: f32) {
         let mut events = Vec::new();
@@ -111,13 +156,16 @@ impl Harness {
             ..Default::default()
         };
 
+        // Highlight the rows about to be drawn, as the application does. Ask
+        // the layout which row the scroll offset lands on - under word wrap
+        // that is a Fenwick lookup, not a division.
+        let first_row = self.layout.row_at(scroll_y, self.style.line_height);
+
         let (left, right) = (&mut self.left, &mut self.right);
         let (diff, layout, inline) = (&self.diff, &mut self.layout, &mut self.inline);
         let (style, palette, longest) = (&self.style, &self.palette, self.longest);
         let opts = DiffOptions::default();
 
-        // Highlight the rows about to be drawn, as the application does.
-        let first_row = (scroll_y / style.line_height) as usize;
         let rows = first_row..(first_row + 60).min(diff.rows.len());
         let (assets, highlighters) = (&self.assets, &mut self.highlighters);
         let hl: Vec<Vec<_>> = [Side::Left, Side::Right]
@@ -129,6 +177,7 @@ impl Harness {
             })
             .collect();
 
+        let gutter_lines = left.len_lines().max(right.len_lines());
         // Never typed into; the pane just needs somewhere to keep it.
         let mut composing = [
             duibi::ui::ime::Composition::default(),
@@ -156,6 +205,8 @@ impl Harness {
                                 inline,
                                 palette,
                                 style,
+                                lang: duibi::i18n::Lang::English,
+                                gutter_lines,
                                 highlights: &hl[usize::from(side == Side::Right)],
                                 highlight_rows: rows.clone(),
                                 search: &[],
@@ -165,6 +216,7 @@ impl Harness {
                                 focus_requested: false,
                                 goal_column: None,
                                 composing: &mut composing[usize::from(side == Side::Right)],
+                                expanded: &Default::default(),
                             },
                         );
                     });
@@ -172,6 +224,9 @@ impl Harness {
             });
         });
         out.textures_delta.clear();
+        // Fold this frame's row measurements into the geometry, as the app
+        // does after both panes have drawn. A no-op in uniform mode.
+        self.layout.commit_measurements();
     }
 }
 
@@ -245,5 +300,67 @@ fn frame_cost_does_not_scale_with_document_size() {
     assert!(
         large < small * 6 + Duration::from_millis(4),
         "frame cost grew with the document: {small:?} -> {large:?}"
+    );
+}
+
+/// The same frame budget over a 100 000-line document with word wrap on.
+///
+/// Wrapped rows have variable heights, so every "which row is at `y`?" goes
+/// through the Fenwick tree in `RowLayout` instead of a division. If that
+/// ever regresses to a linear scan - or if measuring a visible row starts
+/// rebuilding geometry for the whole document - jumping to a random depth in
+/// a huge file stutters, and only a measurement catches it.
+///
+/// The budget is 4x the uniform test's: wrapping pays a real galley layout
+/// per visible row, so the threshold is deliberately loose. It is here to
+/// catch work that scales with the *document*, not to police milliseconds.
+#[test]
+fn drawing_a_wrapped_huge_comparison_stays_interactive() {
+    let mut h = Harness::new_wrapped(WRAPPED_LINES);
+    assert!(
+        !h.layout.is_uniform(),
+        "the test must exercise the Fenwick path, not the uniform shortcut"
+    );
+
+    // Deterministic pseudo-random scroll positions (xorshift64*), spread over
+    // the whole document so no two frames can be served from the same window.
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut random_scroll = |layout: &RowLayout, line_h: f32| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let span = (layout.total_height(line_h) - VIEW.y).max(1.0);
+        (state % span as u64) as f32
+    };
+
+    // Warm up: font atlas, galley cache, first measurements.
+    for _ in 0..6 {
+        let y = random_scroll(&h.layout, h.style.line_height);
+        h.frame(y);
+    }
+
+    const FRAMES: usize = 30;
+    let start = Instant::now();
+    for _ in 0..FRAMES {
+        let y = random_scroll(&h.layout, h.style.line_height);
+        h.frame(y);
+    }
+    let per_frame = start.elapsed() / FRAMES as u32;
+
+    // Sanity: wrapping actually produced variable-height rows - otherwise the
+    // test would be timing the uniform path in disguise.
+    let tallest = (0..h.layout.row_count())
+        .map(|r| h.layout.lines_at(r))
+        .max()
+        .unwrap_or(0);
+    assert!(tallest > 1, "no row was ever measured taller than one line");
+
+    eprintln!(
+        "{WRAPPED_LINES} wrapped lines, two panes: {per_frame:?} per frame ({:.1} fps equivalent)",
+        1.0 / per_frame.as_secs_f64()
+    );
+    assert!(
+        per_frame < Duration::from_millis(200),
+        "a wrapped frame took {per_frame:?}; something is scaling with the document size"
     );
 }

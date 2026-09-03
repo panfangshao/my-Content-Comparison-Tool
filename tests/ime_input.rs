@@ -85,7 +85,6 @@ impl Harness {
                 word_wrap: false,
                 tab_width: 4,
                 vertical_motion: VerticalMotion::KeepColumn,
-                gutter_width: 0.0,
             },
             palette: Palette::dark(),
             first: true,
@@ -109,6 +108,7 @@ impl Harness {
             ..Default::default()
         };
 
+        let gutter_lines = self.buffer.len_lines();
         let (buffer, diff, layout, inline, style, palette, composing) = (
             &mut self.buffer,
             &self.diff,
@@ -134,15 +134,18 @@ impl Harness {
                     inline,
                     palette,
                     style,
+                    lang: duibi::i18n::Lang::English,
+                    gutter_lines,
                     highlights: &[],
                     highlight_rows: 0..0,
                     search: &[],
                     active_match: None,
-                    longest_line: 32,
+                    longest_line: 32.0,
                     force_offset: None,
                     focus_requested,
                     goal_column: None,
                     composing,
+                    expanded: &Default::default(),
                 },
             );
         });

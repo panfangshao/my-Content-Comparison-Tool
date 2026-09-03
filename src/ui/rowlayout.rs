@@ -276,6 +276,29 @@ impl RowLayout {
         w.rebuild_active();
     }
 
+    /// The width `side` should actually wrap at: its own, unless the other
+    /// side wraps at nearly the same width - then both use the narrower one.
+    ///
+    /// A pane-width difference too small to see still flips where a long line
+    /// folds, and since a row is as tall as its side with more visual lines,
+    /// the wider pane then shows a dead band at the bottom of the row even
+    /// though both sides hold the same text. Snapping to the narrower width
+    /// keeps identical lines folded identically. The narrower width is always
+    /// safe: text wrapped tighter can underfill its pane, never overflow it.
+    ///
+    /// Returns `width` unchanged in uniform mode and before the other side has
+    /// reported a width (it draws later in the same frame and snaps then).
+    pub fn aligned_wrap_width(&self, side: Side, width: f32, tolerance: f32) -> f32 {
+        let Some(w) = &self.heights else {
+            return width;
+        };
+        let other = w.widths[1 - side_index(side)];
+        if other.is_nan() || (other - width).abs() > tolerance {
+            return width;
+        }
+        other.min(width)
+    }
+
     /// Fold the measurements taken while drawing into the geometry the next
     /// frame reads. Call once per frame, after every pane has been drawn.
     pub fn commit_measurements(&mut self) {
@@ -288,6 +311,20 @@ impl RowLayout {
         for row in std::mem::take(&mut w.pending) {
             let combined = w.sides[0][row].max(w.sides[1][row]);
             w.active.set(row, combined);
+        }
+    }
+
+    /// How many visual lines `side` folded `row` into.
+    ///
+    /// [`Self::lines_at`] reports the taller of the two sides, which is what
+    /// the row is drawn at. This reports one side on its own, which is what
+    /// makes the two comparable: a row holding identical text on both sides
+    /// must fold to the same count, or the shorter side shows a dead band at
+    /// the bottom of the row.
+    pub fn lines_at_side(&self, side: Side, row: usize) -> u32 {
+        match &self.heights {
+            Some(w) => w.sides[side_index(side)].get(row).copied().unwrap_or(1),
+            None => 1,
         }
     }
 
@@ -576,6 +613,46 @@ mod tests {
         measure_now(&mut l, Side::Left, 0, 4);
         l.set_wrap_width(Side::Left, 300.2); // sub-pixel jitter
         assert_eq!(l.lines_at(0), 4);
+    }
+
+    #[test]
+    fn aligned_wrap_width_snaps_nearly_equal_panes_to_the_narrower() {
+        let mut l = RowLayout::wrapped(4);
+        let tol = 8.68; // one character at 14pt
+
+        // First frame: the left pane has nothing to compare against yet.
+        let w = l.aligned_wrap_width(Side::Left, 600.0, tol);
+        assert_eq!(w, 600.0);
+        l.set_wrap_width(Side::Left, w);
+
+        // The right pane is half a character narrower and keeps its own width.
+        let r = l.aligned_wrap_width(Side::Right, 595.0, tol);
+        assert_eq!(r, 595.0);
+        l.set_wrap_width(Side::Right, r);
+
+        // Next frame the wider pane snaps down to match.
+        assert_eq!(l.aligned_wrap_width(Side::Left, 600.0, tol), 595.0);
+    }
+
+    #[test]
+    fn aligned_wrap_width_never_widens_a_pane() {
+        let mut l = RowLayout::wrapped(4);
+        l.set_wrap_width(Side::Left, 605.0);
+        // Snapping up to 605 would fold text wider than this pane and clip it.
+        assert_eq!(l.aligned_wrap_width(Side::Right, 600.0, 8.68), 600.0);
+    }
+
+    #[test]
+    fn aligned_wrap_width_leaves_genuinely_different_panes_alone() {
+        let mut l = RowLayout::wrapped(4);
+        l.set_wrap_width(Side::Left, 800.0);
+        assert_eq!(l.aligned_wrap_width(Side::Right, 400.0, 8.68), 400.0);
+    }
+
+    #[test]
+    fn aligned_wrap_width_is_a_no_op_in_uniform_mode() {
+        let l = RowLayout::uniform(4);
+        assert_eq!(l.aligned_wrap_width(Side::Left, 600.0, 8.68), 600.0);
     }
 
     /// The whole point: with the same content and different pane widths, both

@@ -150,8 +150,10 @@ impl Config {
             std::fs::create_dir_all(dir)?;
         }
         // Write to a sibling then rename, so a crash mid-write cannot leave a
-        // truncated config behind.
-        let tmp = path.with_extension("json.tmp");
+        // truncated config behind. The process id in the name keeps two
+        // instances quitting at once from clashing, as in
+        // `core::text::encoding::write_file`.
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
         std::fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
         std::fs::rename(&tmp, &path)?;
         Ok(())

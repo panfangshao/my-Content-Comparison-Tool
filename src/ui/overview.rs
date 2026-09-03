@@ -4,10 +4,11 @@
 //! 20 000-line file with eight scattered edits, this is the difference between
 //! "scroll and hope" and "click the third mark".
 //!
-//! Rows are compressed onto pixels, so several hunks can land on the same
-//! pixel. Each mark is therefore drawn with a minimum height and the strongest
-//! change kind in that band wins the colour - losing a difference entirely
-//! because it rounded away would defeat the point.
+//! Rows are compressed onto pixels, so each hunk's mark is drawn with a
+//! minimum height - losing a difference entirely because it rounded away would
+//! defeat the point. A mark's colour is the strongest change kind inside its
+//! own hunk, and where marks overlap they simply paint over one another in
+//! document order.
 
 use egui::{Rect, Sense, Ui, Vec2, pos2};
 

@@ -166,7 +166,7 @@ pub fn show_status_bar(
                         .color(palette.text_faint)
                         .small(),
                 )
-                .on_hover_text("Time spent on the last comparison");
+                .on_hover_text(t(lang, "status.compare_time"));
             }
         });
     });
@@ -332,6 +332,7 @@ mod tests {
             "status.diff_of",
             "status.comparing",
             "status.truncated",
+            "status.compare_time",
         ] {
             for lang in [Lang::Chinese, Lang::English] {
                 assert!(!t(lang, key).is_empty(), "{key} missing for {lang:?}");

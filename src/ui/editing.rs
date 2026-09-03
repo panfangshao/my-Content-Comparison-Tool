@@ -5,6 +5,7 @@
 //! tested directly instead of through a rendered window.
 
 use crate::core::text::{Selection, TextBuffer};
+use crate::ui::tabs;
 
 /// Where Up and Down land horizontally.
 ///
@@ -79,14 +80,17 @@ pub struct Moved {
 /// to its near edge for Left/Right - the standard behaviour that surprises
 /// people when it is missing.
 ///
-/// `goal_column` carries the column the user was last at, so moving down
-/// through a short line and back out does not lose their place.
+/// `goal_column` carries the *display* column the user was last at (tabs
+/// already expanded, via [`tabs::to_display`]), so moving down through a short
+/// line and back out does not lose their place.
+#[allow(clippy::too_many_arguments)]
 pub fn move_caret(
     buf: &TextBuffer,
     motion: Motion,
     extend: bool,
     goal_column: Option<usize>,
     vertical: VerticalMotion,
+    tab_width: usize,
 ) -> Moved {
     let sel = buf.selection();
     let (line, col) = buf.line_col(sel.head);
@@ -108,13 +112,13 @@ pub fn move_caret(
         Motion::Left => (sel.head.saturating_sub(1), None),
         Motion::Right => ((sel.head + 1).min(buf.len_chars()), None),
 
-        Motion::Up => move_vertically(buf, line, col, goal_column, -1, vertical),
-        Motion::Down => move_vertically(buf, line, col, goal_column, 1, vertical),
+        Motion::Up => move_vertically(buf, line, col, goal_column, -1, vertical, tab_width),
+        Motion::Down => move_vertically(buf, line, col, goal_column, 1, vertical, tab_width),
         Motion::PageUp(n) => {
-            move_vertically(buf, line, col, goal_column, -(n as isize), vertical)
+            move_vertically(buf, line, col, goal_column, -(n as isize), vertical, tab_width)
         }
         Motion::PageDown(n) => {
-            move_vertically(buf, line, col, goal_column, n as isize, vertical)
+            move_vertically(buf, line, col, goal_column, n as isize, vertical, tab_width)
         }
 
         Motion::WordLeft => (word_left(buf, sel.head), None),
@@ -143,6 +147,7 @@ fn move_vertically(
     goal_column: Option<usize>,
     delta: isize,
     mode: VerticalMotion,
+    tab_width: usize,
 ) -> (usize, Option<usize>) {
     let last = buf.len_lines().saturating_sub(1);
     let target = (line as isize + delta).clamp(0, last as isize) as usize;
@@ -159,14 +164,19 @@ fn move_vertically(
         return (head, None);
     }
 
-    let goal = goal_column.unwrap_or(col);
+    let goal = goal_column.unwrap_or_else(|| {
+        // The goal is a *display* column, matching how the caret is drawn:
+        // a line with tabs must not pull the caret left on every move.
+        tabs::to_display(buf.line(line), tab_width, col)
+    });
     // Moving past either end parks the caret at the document boundary, which
     // is what pressing Up on the first line should do.
     if at_edge {
         let head = if delta < 0 { 0 } else { buf.len_chars() };
         return (head, Some(goal));
     }
-    (buf.char_at(target, goal), Some(goal))
+    let target_col = tabs::from_display(buf.line(target), tab_width, goal);
+    (buf.char_at(target, target_col), Some(goal))
 }
 
 /// First non-whitespace character of the line, unless we are already there, in
@@ -273,11 +283,26 @@ pub fn insert_newline(buf: &mut TextBuffer) {
     buf.insert(&text);
 }
 
+/// The last line a selection covers: an end sitting exactly at a line's start
+/// leaves that tail line out.
+fn touched_tail(buf: &TextBuffer, sel: &Selection) -> usize {
+    let last = buf.line_of_char(sel.end());
+    if last > buf.line_of_char(sel.start()) && sel.end() == buf.line_start(last) {
+        last - 1
+    } else {
+        last
+    }
+}
+
 /// Indent every line the selection touches by one unit.
+///
+/// A selection whose head sits at column 0 of a line does not touch that
+/// line: select down to the start of a line and press Tab, and that tail line
+/// stays put (the behaviour VS Code has).
 pub fn indent_selection(buf: &mut TextBuffer, unit: &str) {
     let sel = buf.selection();
     let first = buf.line_of_char(sel.start());
-    let last = buf.line_of_char(sel.end());
+    let last = touched_tail(buf, &sel);
     let added = unit.chars().count();
 
     // Capture the caret in (line, column) terms *before* editing: character
@@ -311,7 +336,7 @@ pub fn indent_selection(buf: &mut TextBuffer, unit: &str) {
 pub fn outdent_selection(buf: &mut TextBuffer, unit: &str) {
     let sel = buf.selection();
     let first = buf.line_of_char(sel.start());
-    let last = buf.line_of_char(sel.end());
+    let last = touched_tail(buf, &sel);
     let width = unit.chars().count().max(1);
 
     let anchor_lc = buf.line_col(sel.anchor);
@@ -360,7 +385,7 @@ mod tests {
     }
 
     fn head(b: &TextBuffer, motion: Motion, extend: bool) -> usize {
-        move_caret(b, motion, extend, None, VerticalMotion::KeepColumn).selection.head
+        move_caret(b, motion, extend, None, VerticalMotion::KeepColumn, tabs::TAB_WIDTH).selection.head
     }
 
     #[test]
@@ -386,7 +411,7 @@ mod tests {
     fn shift_extends_from_the_anchor() {
         let mut b = TextBuffer::from_text("hello");
         b.set_selection(Selection::at(2));
-        let m = move_caret(&b, Motion::Right, true, None, VerticalMotion::KeepColumn);
+        let m = move_caret(&b, Motion::Right, true, None, VerticalMotion::KeepColumn, tabs::TAB_WIDTH);
         assert_eq!(m.selection.anchor, 2);
         assert_eq!(m.selection.head, 3);
     }
@@ -396,13 +421,13 @@ mod tests {
         // Down from a long line, through a short one, back to a long one.
         let b = buf("abcdefgh\nxy\nijklmnop", 6); // line 0, column 6
 
-        let down = move_caret(&b, Motion::Down, false, None, VerticalMotion::KeepColumn);
+        let down = move_caret(&b, Motion::Down, false, None, VerticalMotion::KeepColumn, tabs::TAB_WIDTH);
         assert_eq!(b.line_col(down.selection.head), (1, 2), "clamped to short line");
         assert_eq!(down.goal_column, Some(6));
 
         let mut b2 = b;
         b2.set_selection(down.selection);
-        let down2 = move_caret(&b2, Motion::Down, false, down.goal_column, VerticalMotion::KeepColumn);
+        let down2 = move_caret(&b2, Motion::Down, false, down.goal_column, VerticalMotion::KeepColumn, tabs::TAB_WIDTH);
         assert_eq!(
             b2.line_col(down2.selection.head),
             (2, 6),
@@ -411,7 +436,7 @@ mod tests {
     }
 
     fn head_with(b: &TextBuffer, motion: Motion, mode: VerticalMotion) -> usize {
-        move_caret(b, motion, false, None, mode).selection.head
+        move_caret(b, motion, false, None, mode, tabs::TAB_WIDTH).selection.head
     }
 
     /// The alternative behaviour: Up and Down land at the end of the line.
@@ -439,7 +464,7 @@ mod tests {
     #[test]
     fn line_end_mode_forgets_the_goal_column() {
         let b = buf("abcdefgh\nxy\nijklmnop", 6);
-        let moved = move_caret(&b, Motion::Down, false, None, VerticalMotion::LineEnd);
+        let moved = move_caret(&b, Motion::Down, false, None, VerticalMotion::LineEnd, tabs::TAB_WIDTH);
         assert_eq!(
             moved.goal_column, None,
             "there is no column to remember when the destination is the end"
@@ -495,7 +520,7 @@ mod tests {
     fn page_movement_travels_many_lines() {
         let text = (0..100).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
         let b = buf(&text, 0);
-        let m = move_caret(&b, Motion::PageDown(30), false, None, VerticalMotion::KeepColumn);
+        let m = move_caret(&b, Motion::PageDown(30), false, None, VerticalMotion::KeepColumn, tabs::TAB_WIDTH);
         assert_eq!(b.line_col(m.selection.head).0, 30);
     }
 
@@ -668,6 +693,20 @@ mod tests {
         assert_eq!(b.selection().head, b.len_chars());
     }
 
+    /// A selection whose head is at the start of a line does not indent that
+    /// line - the behaviour VS Code has.
+    #[test]
+    fn indent_and_outdent_skip_a_tail_line_touched_only_at_column_zero() {
+        let mut b = TextBuffer::from_text("a\nb");
+        // Select "a\n" exactly: the head sits at column 0 of line 1.
+        b.set_selection(Selection { anchor: 0, head: 2 });
+        indent_selection(&mut b, "  ");
+        assert_eq!(b.lines(), ["  a", "b"], "the tail line must be left alone");
+
+        outdent_selection(&mut b, "  ");
+        assert_eq!(b.lines(), ["a", "b"]);
+    }
+
     #[test]
     fn indent_is_a_single_undo_step() {
         let mut b = TextBuffer::from_text("a\nb");
@@ -698,7 +737,7 @@ mod tests {
             let mut b2 = TextBuffer::from_text("abc\ndef\n");
             b2.set_selection(Selection::at(start));
             for m in motions {
-                let r = move_caret(&b2, m, false, None, VerticalMotion::KeepColumn);
+                let r = move_caret(&b2, m, false, None, VerticalMotion::KeepColumn, tabs::TAB_WIDTH);
                 assert!(
                     r.selection.head <= b2.len_chars(),
                     "{m:?} from {start} escaped the document"

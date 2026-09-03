@@ -16,6 +16,7 @@ eframe = { version = "0.36", default-features = false, features = [
     "default_fonts",
     "wayland",
     "x11",
+    "persistence",   # periodic App::save + window geometry, so a crash loses nothing
 ] }
 egui = "0.36"
 egui_extras = { version = "0.36", features = ["default"] }
